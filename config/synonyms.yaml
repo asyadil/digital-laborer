@@ -1,22 +1,69 @@
 synonyms:
-  try:
-    - test
-    - attempt
-  helped:
-    - supported
-    - assisted
-  simple:
-    - straightforward
-    - basic
-  routine:
-    - habit
-    - process
-  measure:
-    - track
-    - record
-  improve:
-    - refine
-    - enhance
-  focus:
-    - concentrate
-    - prioritize
+  # Common verbs
+  try: [test, attempt, experiment, strive, undertake, endeavor, seek, aim, venture, aspire]
+  help: [assist, support, aid, facilitate, benefit, serve, guide, back, encourage, promote]
+  use: [utilize, employ, apply, operate, wield, harness, exploit, leverage, manipulate, handle]
+  make: [create, produce, generate, construct, build, form, craft, fabricate, manufacture, assemble]
+  show: [demonstrate, display, present, exhibit, illustrate, reveal, indicate, prove, manifest, express]
+  
+  # Adjectives
+  good: [excellent, great, superb, outstanding, remarkable, exceptional, fine, wonderful, terrific, fantastic]
+  bad: [poor, terrible, awful, dreadful, horrible, atrocious, inferior, substandard, unsatisfactory, lousy]
+  important: [crucial, vital, essential, significant, critical, imperative, paramount, fundamental, key, necessary]
+  interesting: [fascinating, engaging, compelling, intriguing, captivating, absorbing, entertaining, stimulating, thought-provoking, gripping]
+  simple: [straightforward, uncomplicated, basic, elementary, clear, plain, easy, effortless, undemanding, painless]
+  
+  # Adverbs
+  quickly: [rapidly, swiftly, speedily, fast, promptly, immediately, instantly, hastily, briskly, apace]
+  very: [extremely, incredibly, exceptionally, immensely, tremendously, exceedingly, remarkably, extraordinarily, particularly, uncommonly]
+  really: [truly, genuinely, indeed, certainly, absolutely, positively, unquestionably, undeniably, veritably, decidedly]
+  
+  # Nouns
+  problem: [issue, challenge, difficulty, obstacle, complication, predicament, dilemma, setback, snag, hitch]
+  solution: [answer, resolution, fix, remedy, cure, panacea, way out, key, explanation, result]
+  idea: [concept, notion, thought, plan, suggestion, proposal, concept, belief, opinion, view]
+  
+  # Topic-specific (finance/investment)
+  invest: [allocate, commit, fund, back, finance, provide capital, put money into, sink money into, speculate, venture]
+  money: [funds, capital, cash, finances, resources, wealth, assets, means, wherewithal, liquidity]
+  return: [yield, profit, gain, earnings, income, revenue, proceeds, interest, dividend, payback]
+  risk: [hazard, danger, peril, threat, uncertainty, exposure, liability, vulnerability, gamble, speculation]
+  
+  # Topic-specific (technology)
+  technology: [innovation, automation, digitalization, IT, high-tech, electronics, computers, machinery, equipment, tools]
+  data: [information, facts, figures, statistics, details, particulars, intelligence, input, evidence, findings]
+  system: [framework, structure, network, organization, setup, arrangement, scheme, method, procedure, process]
+  
+  # Topic-specific (health/wellness)
+  health: [wellness, wellbeing, fitness, condition, shape, constitution, form, fettle, state, status]
+  exercise: [workout, training, physical activity, aerobics, calisthenics, movement, exertion, drill, practice, routine]
+  nutrition: [diet, nourishment, sustenance, food, dietetics, nutriment, subsistence, provisions, fare, menu]
+  
+  # Topic-specific (personal development)
+  improve: [enhance, better, refine, upgrade, boost, advance, develop, progress, grow, strengthen]
+  learn: [study, master, grasp, comprehend, understand, absorb, acquire, pick up, digest, assimilate]
+  change: [modify, alter, adjust, adapt, transform, vary, revise, amend, refine, evolve]
+  
+  # Transitional phrases
+  however: [nevertheless, nonetheless, but, yet, still, though, although, even so, be that as it may, on the other hand]
+  therefore: [thus, hence, consequently, accordingly, so, as a result, because of this, for this reason, that being the case, ergo]
+  additionally: [furthermore, moreover, also, besides, as well, too, in addition, what's more, on top of that, not to mention]
+  
+  # Emotional tone
+  happy: [pleased, delighted, glad, joyful, cheerful, content, satisfied, thrilled, overjoyed, ecstatic]
+  sad: [unhappy, sorrowful, dejected, downcast, miserable, downhearted, despondent, disheartened, forlorn, woeful]
+  angry: [irate, furious, enraged, infuriated, indignant, incensed, wrathful, livid, fuming, seething]
+  
+  # Intensifiers
+  very good: [excellent, superb, outstanding, exceptional, marvelous, wonderful, terrific, fantastic, phenomenal, extraordinary]
+  very bad: [terrible, awful, dreadful, atrocious, appalling, horrendous, abysmal, dire, deplorable, egregious]
+  very big: [enormous, huge, massive, gigantic, immense, colossal, tremendous, vast, mammoth, gargantuan]
+  
+  # Common phrases
+  a lot of: [numerous, many, countless, innumerable, myriad, a multitude of, a great deal of, an abundance of, plenty of, a wealth of]
+  in order to: [so as to, with the aim of, with the intention of, for the purpose of, as a means to, with a view to, so that, that one may, in an effort to, with the goal of]
+  
+  # Common connectors
+  because: [since, as, for, inasmuch as, seeing that, considering that, on the grounds that, owing to the fact that, due to the fact that, for the reason that]
+  but: [however, yet, nevertheless, nonetheless, still, although, though, even though, while, whereas]
+  so: [therefore, thus, hence, consequently, as a result, accordingly, for this reason, that being the case, because of this, as a consequence]

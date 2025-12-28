@@ -121,64 +121,195 @@ class SystemOrchestrator:
                 signal.signal(sig, lambda *_args: _handler())
 
     async def _handle_approved_post(self, post_id: int) -> None:
-        """Handle auto-posting of approved content if configured."""
+        """Handle auto-posting of approved content if configured.
+        
+        This is a compatibility wrapper for the new _auto_post_approved_content method.
+        """
+        return await self._auto_post_approved_content(post_id)
+        
+    async def _auto_post_approved_content(self, post_id: int) -> None:
+        """Post approved content to the target platform.
+        
+        Args:
+            post_id: ID of the post to publish
+            
+        This method handles the entire auto-posting workflow including:
+        - Loading the post from the database
+        - Finding a healthy account
+        - Posting the content
+        - Updating the post status
+        - Sending notifications
+        """
         try:
+            # Load the post from the database
             with self.db.session_scope() as session:
                 post = session.query(Post).filter(Post.id == post_id).first()
                 if not post or post.status != PostStatus.APPROVED:
                     self.logger.warning(f"Post {post_id} not found or not approved, skipping auto-post")
-                    return
-
+                    return False
+                
+                platform = post.platform
+                
                 # Check if auto-posting is enabled for this platform
-                platform_config = self.config_manager.get(f"platforms.{post.platform}")
-                if not platform_config.get('auto_post_after_approval', False):
-                    self.logger.info(f"Auto-posting disabled for {post.platform}, skipping")
-                    return
-
-                # Get account for the platform
-                account = session.query(Account).filter(
-                    Account.platform == post.platform,
-                    Account.is_active == True  # noqa: E712
-                ).first()
-
-                if not account:
-                    self.logger.error(f"No active account found for platform {post.platform}")
-                    return
-
-                # Initialize platform adapter
-                adapter = None
-                if post.platform == 'reddit':
-                    adapter = RedditAdapter(account, self.config_manager)
-                # Add other platform adapters here
-
-                if not adapter:
-                    self.logger.error(f"No adapter found for platform {post.platform}")
-                    return
-
-                # Post the content
-                self.logger.info(f"Auto-posting content to {post.platform}...")
-                result = await adapter.post_comment(
-                    content=post.content,
-                    target_url=post.target_url,
-                    metadata=post.metadata
+                platform_config = self.config_manager.get(f"platforms.{platform}")
+                if not platform_config or not platform_config.get('auto_post_after_approval', False):
+                    self.logger.info(f"Auto-posting disabled for {platform}, skipping")
+                    return False
+                
+                # Update post status to POSTING
+                post.status = PostStatus.POSTING
+                post.updated_at = datetime.utcnow()
+                session.add(post)
+                session.commit()
+                
+            # Initialize the appropriate adapter
+            adapter = None
+            if platform == 'reddit':
+                from src.platforms.reddit_adapter import RedditAdapter
+                adapter = RedditAdapter(
+                    config=self.config_manager.config,
+                    db_session=self.db.session_factory(),
+                    logger=self.logger.getChild("reddit_adapter")
                 )
-
-                if result.success:
+            # Add other platform adapters here
+            
+            if not adapter:
+                error_msg = f"No adapter found for platform {platform}"
+                self.logger.error(error_msg)
+                with self.db.session_scope() as session:
+                    post = session.merge(post)
+                    post.status = PostStatus.FAILED
+                    post.error_message = error_msg
+                    session.add(post)
+                return False
+            
+            # Post the content using the adapter
+            self.logger.info(f"Posting content to {platform} (post_id={post_id})...")
+            
+            # For Reddit, we need to find a target post first
+            target_post = None
+            if platform == 'reddit':
+                # Get subreddit from post metadata
+                subreddit = post.metadata_json.get('subreddit') if post.metadata_json else None
+                if not subreddit:
+                    error_msg = "No subreddit specified in post metadata"
+                    self.logger.error(error_msg)
+                    with self.db.session_scope() as session:
+                        post = session.merge(post)
+                        post.status = PostStatus.FAILED
+                        post.error_message = error_msg
+                        session.add(post)
+                    return False
+                
+                # Find a suitable target post
+                find_result = adapter.find_target_posts(
+                    location=subreddit,
+                    limit=5,  # Get top 5 posts to choose from
+                    min_score=10,  # Minimum upvotes
+                    min_comments=3  # Minimum comments
+                )
+                
+                if not find_result.success or not find_result.data.get('items'):
+                    error_msg = f"Failed to find target posts in r/{subreddit}: {find_result.error}"
+                    self.logger.error(error_msg)
+                    with self.db.session_scope() as session:
+                        post = session.merge(post)
+                        post.status = PostStatus.FAILED
+                        post.error_message = error_msg
+                        session.add(post)
+                    return False
+                
+                # Select the first target post
+                target_post = find_result.data['items'][0]
+                self.logger.info(f"Found target post: {target_post.get('title', 'No title')}")
+            
+            # Post the content
+            post_result = await adapter.post_comment(
+                target_id=target_post['id'] if target_post else None,
+                content=post.content,
+                account=None  # Let the adapter choose the best account
+            )
+            
+            # Handle the result
+            with self.db.session_scope() as session:
+                post = session.merge(post)
+                
+                if post_result.success:
+                    # Update post status and metadata
                     post.status = PostStatus.POSTED
                     post.posted_at = datetime.utcnow()
-                    post.external_id = result.data.get('id')
+                    post.external_id = post_result.data.get('comment_id')
+                    post.url = post_result.data.get('comment_url')
+                    
+                    # Update metadata with posting details
+                    metadata = post.metadata_json or {}
+                    metadata.update({
+                        'posted_at': post.posted_at.isoformat(),
+                        'external_id': post.external_id,
+                        'url': post.url,
+                        'account_id': post_result.data.get('account_id'),
+                        'username': post_result.data.get('username'),
+                        'target_post': target_post if target_post else None
+                    })
+                    post.metadata_json = metadata
+                    
                     session.add(post)
-                    self.logger.info(f"Successfully posted content to {post.platform}")
+                    
+                    # Send success notification
+                    if self.telegram:
+                        message = (
+                            f"✅ Successfully posted to {platform.upper()}\n"
+                            f"📝 Post ID: {post_id}\n"
+                            f"🔗 URL: {post.url}\n"
+                            f"👤 Account: {post_result.data.get('username', 'Unknown')}"
+                        )
+                        await self.telegram.send_notification(message, priority="INFO")
+                    
+                    self.logger.info(f"Successfully posted content to {platform} (post_id={post_id})")
+                    return True
                 else:
+                    # Handle failure
+                    error_msg = post_result.error or "Unknown error"
                     post.status = PostStatus.FAILED
-                    post.error_message = result.error
+                    post.error_message = error_msg
                     session.add(post)
+                    
+                    # Send error notification
+                    if self.telegram:
+                        message = (
+                            f"❌ Failed to post to {platform.upper()}\n"
+                            f"📝 Post ID: {post_id}\n"
+                            f"❌ Error: {error_msg}"
+                        )
+                        await self.telegram.send_notification(message, priority="ERROR")
+                    
                     self.logger.error(
-                        f"Failed to post content to {post.platform}: {result.error}"
+                        f"Failed to post content to {platform} (post_id={post_id}): {error_msg}",
+                        extra={"error": error_msg, "post_id": post_id, "platform": platform}
                     )
-
+                    return False
+                    
         except Exception as e:
-            self.logger.error(f"Error in _handle_approved_post: {str(e)}", exc_info=True)
+            error_msg = f"Unexpected error in _auto_post_approved_content: {str(e)}"
+            self.logger.error(error_msg, exc_info=True)
+            
+            # Update post status to failed
+            with self.db.session_scope() as session:
+                post = session.merge(post)
+                post.status = PostStatus.FAILED
+                post.error_message = error_msg
+                session.add(post)
+            
+            # Send error notification
+            if self.telegram:
+                message = (
+                    f"❌ Unexpected error while posting\n"
+                    f"📝 Post ID: {post_id}\n"
+                    f"❌ Error: {str(e)[:200]}"
+                )
+                await self.telegram.send_notification(message, priority="ERROR")
+            
+            return False
 
     async def graceful_shutdown(self) -> None:
         try:
@@ -340,7 +471,12 @@ class SystemOrchestrator:
                     
                     # Handle auto-posting if enabled
                     if not review.timeout and reddit_cfg.auto_post_after_approval:
-                        asyncio.create_task(self._handle_approved_post(post_id))
+                        # Use create_task to run in background
+                        asyncio.create_task(self._auto_post_approved_content(post_id))
+                        self.logger.info(
+                            f"Auto-posting started for post_id={post_id}",
+                            extra={"post_id": post_id, "subreddit": subreddit}
+                        )
                     
                     self.logger.info(
                         f"Content review completed, auto-post: {reddit_cfg.auto_post_after_approval}",
