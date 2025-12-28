@@ -1,0 +1,16 @@
+aiohttp==3.11.11
+alembic==1.12.1
+cryptography==41.0.7
+pydantic==1.10.14
+psutil==5.9.6
+prometheus-client==0.19.0
+python-dotenv==1.0.0
+python-telegram-bot==20.6
+PyYAML==6.0.2
+SQLAlchemy==2.0.43
+praw==7.7.1
+selenium==4.16.0
+undetected-chromedriver==3.5.2
+pytest==7.4.3
+pytest-asyncio==0.21.1
+uvloop==0.19.0; platform_system != "Windows"

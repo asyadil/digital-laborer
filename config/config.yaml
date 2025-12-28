@@ -1,0 +1,82 @@
+system:
+  name: "Referral Automation System"
+  version: "1.0.0"
+  timezone: "UTC"
+  max_concurrent_tasks: 5
+
+telegram:
+  bot_token: ${TELEGRAM_BOT_TOKEN}
+  user_chat_id: ${TELEGRAM_USER_CHAT_ID}
+  notification_level: "INFO"
+  timeout_seconds: 3600
+  retry_attempts: 3
+
+database:
+  type: "sqlite"
+  path: "data/database.db"
+  backup_enabled: true
+  backup_interval_hours: 24
+
+platforms:
+  reddit:
+    enabled: true
+    oauth:
+      client_id: ${REDDIT_CLIENT_ID}
+      client_secret: ${REDDIT_CLIENT_SECRET}
+      user_agent: ${REDDIT_USER_AGENT}
+      username: ${REDDIT_USERNAME}
+      password: ${REDDIT_PASSWORD}
+    max_posts_per_day: 15
+    min_delay_between_posts: 600
+    max_delay_between_posts: 1800
+    quality_threshold: 0.7
+    subreddits:
+      - "beermoney"
+      - "passive_income"
+      - "sidehustle"
+  youtube:
+    enabled: true
+    max_comments_per_day: 20
+    search_keywords:
+      - "passive income apps"
+      - "make money online"
+      - "side hustle"
+      - "how to make money online"
+      - "how to make money"
+      - "make money form home"
+      - "make money"
+      - "easiest way to make money"
+  quora:
+    enabled: true
+    max_answers_per_day: 5
+    topics:
+      - "Passive Income"
+      - "Side Hustles"
+
+content:
+  min_length: 200
+  max_length: 800
+  quality_threshold: 0.7
+  public_sources:
+    - "https://www.usa.gov/agencies"
+    - "https://archive.org/details/texts"
+
+monitoring:
+  health_check_interval: 300
+  alert_thresholds:
+    error_rate: 0.1
+    ban_rate: 0.05
+  metrics_retention_days: 90
+
+retry:
+  max_attempts: 3
+  base_delay: 5
+  max_delay: 300
+  exponential_backoff: true
+
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file_path: "data/logs/system.log"
+  max_file_size_mb: 10
+  backup_count: 5

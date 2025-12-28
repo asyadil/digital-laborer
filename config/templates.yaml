@@ -1,0 +1,54 @@
+templates:
+  - id: reddit_experience_1
+    platform: reddit
+    name: Experience reply
+    min_words: 200
+    max_words: 500
+    text: |
+      {% if subreddit %}
+      I’ve been following r/{{subreddit}} for a while, and one thing I’ve noticed is that most people get better results when they keep it practical.
+      {% endif %}
+      
+      What worked for me was starting with one simple routine, tracking it for two weeks, and only then adding complexity.
+      
+      If your goal is something sustainable, think in terms of repeatable steps:
+      - pick one approach
+      - measure a basic outcome
+      - improve one part at a time
+      
+      The “boring” approach usually wins long-term.
+
+  - id: youtube_story_1
+    platform: youtube
+    name: Personal story
+    min_words: 150
+    max_words: 400
+    text: |
+      I liked this video because it’s honest about the work involved.
+      
+      When I first tried to learn {{topic}}, I made the mistake of jumping between methods.
+      What helped me was sticking to one plan for 14 days and writing down what actually worked.
+      
+      If anyone is new, start small and focus on consistency.
+
+  - id: quora_structured_1
+    platform: quora
+    name: Structured answer
+    min_words: 800
+    max_words: 2000
+    text: |
+      Here’s a structured answer to: {{question}}
+      
+      **1) Quick analysis**
+      The core of your question is really about constraints: time, risk tolerance, and how consistent you can be.
+      
+      **2) A practical framework**
+      - Define your available time per day
+      - Choose one method that matches your skills
+      - Track results weekly
+      
+      **3) Common mistakes**
+      People often chase shortcuts, over-optimize too early, or quit before they have a baseline.
+      
+      **4) Conclusion**
+      Start simple, measure, then iterate.
