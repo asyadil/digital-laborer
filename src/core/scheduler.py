@@ -31,6 +31,7 @@ class Scheduler:
         self._seq = 0
         self._wake_event = asyncio.Event()
         self._stopping = False
+        self._running = False
 
     def schedule_once(self, name: str, when: datetime, coro_factory: Callable[[], Awaitable[None]]) -> None:
         self._push(name=name, when=when, coro_factory=coro_factory, interval_seconds=None)
@@ -48,6 +49,7 @@ class Scheduler:
     async def run(self, stop_event: asyncio.Event) -> None:
         """Run scheduler loop until stop_event is set."""
         self._stopping = False
+        self._running = True
         try:
             while not stop_event.is_set() and not self._stopping:
                 now = datetime.now(timezone.utc).timestamp()
@@ -73,6 +75,8 @@ class Scheduler:
 
         except asyncio.CancelledError:
             return
+        finally:
+            self._running = False
 
     async def _run_item(self, item: _ScheduledItem) -> None:
         try:
@@ -97,3 +101,6 @@ class Scheduler:
     def stop(self) -> None:
         self._stopping = True
         self._wake_event.set()
+
+    def is_running(self) -> bool:
+        return self._running and not self._stopping

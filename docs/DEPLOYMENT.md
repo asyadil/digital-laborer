@@ -14,9 +14,9 @@
    ```bash
    cp config/config.sample.yaml config/config.yaml
    ```
-3. Run migrations (SQLite auto-creates tables):
+3. Jalankan aplikasi (migrations otomatis via orchestrator):
    ```bash
-   python -m src.core.orchestrator config/config.yaml
+   python main.py --config config/config.yaml
    ```
 
 ## Systemd Service (Linux)
@@ -30,7 +30,7 @@ After=network.target
 Type=simple
 User=www-data
 WorkingDirectory=/opt/referral
-ExecStart=/usr/bin/python -m src.core.orchestrator config/config.yaml
+ExecStart=/usr/bin/python /opt/referral/main.py --config /opt/referral/config/config.yaml
 Restart=on-failure
 Environment=PYTHONUNBUFFERED=1
 

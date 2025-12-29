@@ -1,24 +1,24 @@
-"""Database migration utilities using SQLAlchemy metadata.
-
-Lightweight migration runner for environments without Alembic.
-- Backs up SQLite DB (optional)
-- Applies metadata create_all
-- Ensures critical columns exist for compatibility with new schema
-"""
+"""Versioned migration runner with registry tracking."""
 from __future__ import annotations
 
+import importlib
 import logging
 import shutil
+import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Iterable
+from typing import Callable, List, Optional
 
-from sqlalchemy import text
+from sqlalchemy import Table, Column, Integer, String, Boolean, Text, DateTime, MetaData, select
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import SQLAlchemyError
 
 from src.database.models import Base
 
 logger = logging.getLogger(__name__)
+
+MIGRATIONS_PACKAGE = "src.database.migrations"
+MIGRATIONS_DIR = Path(__file__).parent
 
 
 def backup_sqlite_database(db_path: str, backup_dir: Optional[str] = None) -> Optional[Path]:
@@ -35,50 +35,85 @@ def backup_sqlite_database(db_path: str, backup_dir: Optional[str] = None) -> Op
     return backup_file
 
 
-def _sqlite_table_columns(engine: Engine, table: str) -> set[str]:
-    with engine.connect() as conn:
-        rows = conn.execute(text(f"PRAGMA table_info('{table}')")).fetchall()
-    return {row[1] for row in rows}
+def _ensure_registry(engine: Engine) -> Table:
+    """Create migrations_applied registry table if absent."""
+    metadata = MetaData()
+    table = Table(
+        "migrations_applied",
+        metadata,
+        Column("id", Integer, primary_key=True, autoincrement=True),
+        Column("version", String(200), unique=True, nullable=False, index=True),
+        Column("description", Text),
+        Column("applied_at", DateTime, nullable=False),
+        Column("applied_by", String(100)),
+        Column("success", Boolean, nullable=False, default=True),
+        Column("error_message", Text),
+        Column("duration_ms", Integer),
+    )
+    metadata.create_all(engine, tables=[table])
+    return table
 
 
-def _sqlite_add_column_if_missing(
-    engine: Engine,
-    table: str,
-    column: str,
-    ddl: str,
-    existing: Optional[Iterable[str]] = None,
-) -> None:
-    existing_cols = set(existing) if existing is not None else _sqlite_table_columns(engine, table)
-    if column in existing_cols:
-        return
-    with engine.connect() as conn:
-        logger.info("Adding column %s.%s via ALTER TABLE", table, column)
-        conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {ddl}"))
+def _load_migration_modules() -> List[str]:
+    files = sorted(f.stem for f in MIGRATIONS_DIR.glob("*.py") if f.stem not in {"__init__", "migrations"})
+    return files
 
 
-def _sqlite_patch_posts(engine: Engine) -> None:
-    """Ensure posts table has new columns introduced in schema updates."""
-    cols = _sqlite_table_columns(engine, "posts")
-    # external_id: TEXT
-    _sqlite_add_column_if_missing(engine, "posts", "external_id", "TEXT", existing=cols)
-    cols.add("external_id")
-    # error_message: TEXT
-    _sqlite_add_column_if_missing(engine, "posts", "error_message", "TEXT", existing=cols)
-    cols.add("error_message")
-    # quality_breakdown: store as TEXT (JSON serialized)
-    _sqlite_add_column_if_missing(engine, "posts", "quality_breakdown", "TEXT", existing=cols)
+def _import_migration(module_name: str):
+    return importlib.import_module(f"{MIGRATIONS_PACKAGE}.{module_name}")
 
 
 def run_migrations(engine: Engine, backup_first: bool = True, backup_dir: Optional[str] = None) -> None:
-    """Apply metadata and patch critical columns if schema evolved."""
+    """Apply pending migrations in order with registry tracking."""
     url = str(engine.url)
     if backup_first and url.startswith("sqlite"):
         db_path = url.split("///")[-1]
         backup_sqlite_database(db_path, backup_dir=backup_dir)
 
-    # Base metadata (idempotent create_all)
+    # Ensure base metadata exists for initial schema
     Base.metadata.create_all(engine)
 
-    # Lightweight column patching for SQLite
-    if url.startswith("sqlite"):
-        _sqlite_patch_posts(engine)
+    registry = _ensure_registry(engine)
+    applied_versions = set()
+    with engine.connect() as conn:
+        existing = conn.execute(select(registry.c.version)).fetchall()
+        applied_versions = {row[0] for row in existing}
+
+    migrations = _load_migration_modules()
+    for module_name in migrations:
+        module = _import_migration(module_name)
+        version = getattr(module, "version", module_name)
+        description = getattr(module, "description", "")
+        up_fn: Callable[[Engine], None] = getattr(module, "up", None)
+        if not up_fn:
+            logger.warning("Migration %s missing up() function; skipping", module_name)
+            continue
+        if version in applied_versions:
+            continue
+
+        start = time.perf_counter()
+        success = True
+        error_message = None
+        try:
+            with engine.begin() as conn:
+                up_fn(conn)
+        except SQLAlchemyError as exc:
+            success = False
+            error_message = str(exc)
+            logger.error("Migration %s failed: %s", version, exc)
+            raise
+        finally:
+            duration_ms = int((time.perf_counter() - start) * 1000)
+            with engine.begin() as conn:
+                conn.execute(
+                    registry.insert().values(
+                        version=version,
+                        description=description,
+                        applied_at=datetime.utcnow(),
+                        applied_by="system",
+                        success=success,
+                        error_message=error_message,
+                        duration_ms=duration_ms,
+                    )
+                )
+        logger.info("Applied migration %s in %sms", version, duration_ms)

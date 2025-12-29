@@ -8,12 +8,14 @@ import asyncio
 import logging
 import signal
 from datetime import datetime, timedelta
-from typing import Optional, Any
+from typing import Optional, Any, List, Dict
 import os
 import yaml
+from pathlib import Path
 
 from src.database.operations import create_engine_from_config, init_db, DatabaseSessionManager
 from src.database.models import Post, PostStatus, Account
+from src.database.migrations import run_migrations
 from src.core.scheduler import Scheduler
 from src.platforms.reddit_adapter import RedditAdapter
 from src.platforms.youtube_adapter import YouTubeAdapter
@@ -27,10 +29,49 @@ from src.monitoring.health_checker import HealthChecker
 from src.monitoring.analytics import Analytics
 from src.monitoring.alert_manager import AlertManager
 from src.core.account_manager import AccountManager
+from src.core.startup_validation import run_preflight_checks
+from src.core.health_checker_startup import run_startup_health_checks, StartupHealthError
+from src.utils.secrets_manager import SecretsManager
+
+
+class NullTelegram:
+    """Degraded-mode Telegram placeholder; logs locally only."""
+
+    def __init__(self, logger: logging.Logger) -> None:
+        self.logger = logger
+        self.paused = False
+
+    async def start(self) -> None:  # pragma: no cover - simple stub
+        self.logger.warning("Telegram disabled; running in degraded mode", extra={"component": "telegram"})
+
+    async def stop(self) -> None:  # pragma: no cover - simple stub
+        return None
+
+    async def send_notification(self, message: str, priority: str = "INFO", **_: Any) -> None:
+        self.logger.log(
+            logging.WARNING if priority.upper() in {"ERROR", "WARNING"} else logging.INFO,
+            "[TELEGRAM DEGRADED] %s",
+            message,
+            extra={"component": "telegram"},
+        )
+
+    async def request_human_input(self, *_, **__) -> Any:
+        class _Response:
+            response_value: Optional[str] = None
+            timeout: bool = True
+
+        return _Response()
 
 
 class SystemOrchestrator:
-    def __init__(self, config_path: str) -> None:
+    CRITICAL_SERVICES = {"database"}
+    OPTIONAL_SERVICES = {"telegram", "reddit", "youtube", "monitoring"}
+
+    def __init__(self, config_path: str, skip_validation: bool = False) -> None:
+        self.base_path = Path(os.getenv("APP_BASE_PATH", Path.cwd()))
+        self.skip_validation = skip_validation
+        self.secrets = SecretsManager(env_file_path=self.base_path / ".env")
+        self._hydrate_env_secrets()
         self.config_manager = ConfigManager(config_path=config_path)
         self.config_manager.register_reload_on_sighup()
 
@@ -45,6 +86,7 @@ class SystemOrchestrator:
 
         engine = create_engine_from_config(self.config_manager.config.database)
         init_db(engine)
+        run_migrations(engine)
         self.db = DatabaseSessionManager(engine=engine)
 
         self.state_manager = StateManager(db=self.db, logger=self.logger.getChild("state"))
@@ -61,24 +103,59 @@ class SystemOrchestrator:
         self.youtube_adapter: Optional[YouTubeAdapter] = None
         self._stop_event = asyncio.Event()
         self._shutdown_event = asyncio.Event()
+        self.service_health: dict[str, str] = {}
+        self.degraded_mode = False
+        self._recovery_backoff_seconds = 300
+        self._monitoring_disabled = False
 
     async def start(self) -> None:
         try:
             self.logger.info("Starting orchestrator", extra={"component": "orchestrator"})
 
-            self.telegram = TelegramController(
-                bot_token=self.config_manager.config.telegram.bot_token,
-                user_chat_id=self.config_manager.config.telegram.user_chat_id,
-                config=self.config_manager.config,
-                db=self.db,
-                logger=self.logger.getChild("telegram"),
-                log_file_path=self.config_manager.config.logging.file_path,
-            )
+            if not self.skip_validation:
+                report = run_preflight_checks(
+                    config=self.config_manager.config,
+                    engine=self.db.engine,
+                    base_path=self.base_path,
+                )
+                formatted = report.format()
+                print(formatted)
+                self.logger.info(
+                    "Pre-flight checks completed",
+                    extra={
+                        "component": "orchestrator",
+                        "errors": len(report.errors),
+                        "warnings": len(report.warnings),
+                    },
+                )
+                if report.errors:
+                    raise SystemExit("Startup blocked due to pre-flight errors")
+            else:
+                self.logger.warning(
+                    "Pre-flight validation skipped via flag --skip-validation",
+                    extra={"component": "orchestrator"},
+                )
+
+            self._init_telegram()
             self._validate_config()
             if self.health_checker:
                 self.health_checker.telegram = self.telegram
             if self.alert_manager:
                 self.alert_manager.telegram = self.telegram
+            try:
+                await run_startup_health_checks(
+                    engine=self.db.engine,
+                    telegram=self.telegram,
+                    scheduler=self.scheduler,
+                    logger=self.logger,
+                    critical=["database"],
+                )
+            except StartupHealthError as exc:
+                self.logger.error(
+                    "Startup health checks failed",
+                    extra={"component": "orchestrator", "error": str(exc)},
+                )
+                raise SystemExit(str(exc))
 
             self._load_content_resources()
             self._register_signal_handlers()
@@ -428,6 +505,14 @@ class SystemOrchestrator:
             coro_factory=lambda: self._run_health_check(),
         )
 
+        # Recovery loop for degraded adapters/services
+        self.scheduler.schedule_every(
+            "service_recovery",
+            interval_seconds=self._recovery_backoff_seconds,
+            start_in_seconds=self._recovery_backoff_seconds,
+            coro_factory=lambda: self._recover_adapters(),
+        )
+
         # Daily analytics at 09:00 UTC
         start_in = self._seconds_until_utc_hour(9)
         self.scheduler.schedule_every(
@@ -489,12 +574,21 @@ class SystemOrchestrator:
     def _init_platform_adapters(self) -> None:
         cfg = self.config_manager.config
         self.reddit_adapter = None  # instantiate on demand with active DB session
-        self.youtube_adapter = YouTubeAdapter(
-            config=cfg,
-            credentials=[],
-            logger=self.logger.getChild("youtube"),
-            telegram=self.telegram,
-        )
+        try:
+            self.youtube_adapter = YouTubeAdapter(
+                config=cfg,
+                credentials=[],
+                logger=self.logger.getChild("youtube"),
+                telegram=self.telegram,
+            )
+            self._set_health("youtube", "healthy")
+        except Exception as exc:
+            self.youtube_adapter = None
+            self._set_health("youtube", "degraded", reason=str(exc))
+            self.logger.error(
+                "Failed to initialize YouTube adapter",
+                extra={"component": "orchestrator", "error": str(exc)},
+            )
         # Integrate monitoring helpers with adapters if needed later
 
     def _get_reddit_adapter(self) -> tuple[Optional[RedditAdapter], Optional[object]]:
@@ -508,13 +602,107 @@ class SystemOrchestrator:
                 telegram=self.telegram,
                 db_session=session,
             )
+            self._set_health("reddit", "healthy")
             return adapter, session
         except Exception as exc:
             self.logger.error(
                 "Failed to initialize Reddit adapter",
                 extra={"component": "orchestrator", "error": str(exc)},
             )
+            self._set_health("reddit", "degraded", reason=str(exc))
             return None, None
+
+    def _init_telegram(self) -> None:
+        """Initialize Telegram with degraded fallback."""
+        try:
+            self.telegram = TelegramController(
+                bot_token=self.config_manager.config.telegram.bot_token,
+                user_chat_id=self.config_manager.config.telegram.user_chat_id,
+                config=self.config_manager.config,
+                db=self.db,
+                logger=self.logger.getChild("telegram"),
+                log_file_path=self.config_manager.config.logging.file_path,
+            )
+            self._set_health("telegram", "healthy")
+        except Exception as exc:
+            self.logger.error(
+                "Telegram initialization failed; entering degraded mode",
+                extra={"component": "orchestrator", "error": str(exc)},
+            )
+            self.degraded_mode = True
+            self._set_health("telegram", "degraded")
+            self.telegram = NullTelegram(logger=self.logger.getChild("telegram"))
+
+    def _recover_adapters(self) -> None:
+        """Attempt recovery for degraded optional services."""
+        # Retry Reddit adapter if previously failed
+        if self.reddit_adapter is None:
+            adapter, _session = self._get_reddit_adapter()
+            if adapter:
+                self.reddit_adapter = adapter
+                self._set_health("reddit", "healthy")
+                self.logger.info("Recovered Reddit adapter", extra={"component": "orchestrator"})
+        # Retry YouTube adapter
+        if self.youtube_adapter is None:
+            try:
+                self.youtube_adapter = YouTubeAdapter(
+                    config=self.config_manager.config,
+                    credentials=[],
+                    logger=self.logger.getChild("youtube"),
+                    telegram=self.telegram,
+                )
+                self._set_health("youtube", "healthy")
+                self.logger.info("Recovered YouTube adapter", extra={"component": "orchestrator"})
+            except Exception as exc:
+                self._set_health("youtube", "degraded", reason=str(exc))
+
+    def _set_health(self, service: str, status: str, reason: str | None = None) -> None:
+        """Track service health and optionally mark degraded mode."""
+        self.service_health[service] = status
+        if status != "healthy":
+            self.degraded_mode = True
+            if reason:
+                self.logger.warning(
+                    "Service %s degraded: %s", service, reason, extra={"component": "orchestrator"}
+                )
+            else:
+                self.logger.warning(
+                    "Service %s degraded", service, extra={"component": "orchestrator"}
+                )
+
+    def _hydrate_env_secrets(self) -> None:
+        """Populate environment variables from secrets manager if missing/placeholder."""
+        required = [
+            "TELEGRAM_BOT_TOKEN",
+            "TELEGRAM_USER_CHAT_ID",
+            "REDDIT_CLIENT_ID",
+            "REDDIT_CLIENT_SECRET",
+            "REDDIT_USERNAME",
+            "REDDIT_PASSWORD",
+            "REDDIT_USER_AGENT",
+            "ENCRYPTION_KEY",
+        ]
+
+        def _is_placeholder(val: str | None) -> bool:
+            if val is None:
+                return True
+            cleaned = val.strip()
+            if not cleaned:
+                return True
+            lowered = cleaned.lower()
+            return cleaned in {"REPLACE_ME", "CHANGE_ME", "TODO", "xxx", "XXXX"} or lowered in {"changeme", "replace_me", "xxx"}
+
+        for name in required:
+            current = os.getenv(name)
+            if current and not _is_placeholder(current):
+                continue
+            try:
+                secret = self.secrets.get(name, required=False)
+                if secret and not _is_placeholder(secret):
+                    os.environ[name] = secret
+            except Exception:
+                # Do not fail here; validation step will catch missing secrets.
+                continue
 
     async def execute_daily_routine(self) -> None:
         """Generate drafts for configured platforms (no auto-post)."""
@@ -631,6 +819,19 @@ class SystemOrchestrator:
         try:
             results = await self.health_checker.check_all()
             overall = results.get("overall")
+            for name, res in results.items():
+                if name == "overall":
+                    continue
+                self._set_health(name, res.status, reason=res.error)
+            # Critical check: database must remain healthy
+            db_res = results.get("database")
+            if db_res and db_res.status != "healthy":
+                self.logger.critical(
+                    "Database health is %s; initiating graceful shutdown",
+                    db_res.status,
+                    extra={"component": "orchestrator", "db_status": db_res.status, "details": db_res.details},
+                )
+                self._stop_event.set()
             if overall:
                 self.logger.info(
                     "Health check completed",
@@ -649,6 +850,8 @@ class SystemOrchestrator:
                 "Health check failed",
                 extra={"component": "health", "error": str(exc)},
             )
+            self._monitoring_disabled = True
+            self._set_health("monitoring", "degraded", reason=str(exc))
         finally:
             if self.account_manager:
                 # Reactivate or disable accounts based on health drift

@@ -26,6 +26,12 @@ env/
 venv/
 ENV/
 .env
+.env.local
+.env.production
+.env.staging
+.env.test
+data/.encryption_key
+data/.secrets_backup
 .vscode/
 .idea/
 .pytest_cache/

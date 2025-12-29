@@ -11,3 +11,6 @@
 - [ ] Deployment service set up (systemd or Docker) with restart on failure.
 - [ ] Alerts wired: Telegram notifications received for test alert.
 - [ ] Analytics report delivered (daily/weekly) and reviewed for correctness.
+- [ ] Encryption key backed up; .env and data/.encryption_key present with 600 perms (POSIX).
+- [ ] Migrations registry present; migrations applied cleanly; backup taken before migrations.
+- [ ] Disk space > 1GB free; data/ directories writable.

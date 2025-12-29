@@ -24,11 +24,13 @@
   - [configyaml Reference](#configyaml-reference)
   - [Platform Setup (Reddit, YouTube, Quora)](#platform-setup-reddit-youtube-quora)
   - [Security Best Practices](#security-best-practices)
+- [Startup Validation & Health](#startup-validation--health)
 - [Running the System](#running-the-system)
   - [Development Mode](#development-mode)
   - [Production Deployment](#production-deployment)
   - [Monitoring & Logs](#monitoring--logs)
   - [Start/Stop/Restart](#startstoprestart)
+- [Resilience & Migrations](#resilience--migrations)
 - [Telegram Bot Commands](#telegram-bot-commands)
 - [Troubleshooting](#troubleshooting)
 - [Testing Guide](#testing-guide)
@@ -370,6 +372,33 @@ Configuration verification checklist:
 - Set least-privilege DB credentials; enable SSL for Postgres/MySQL.
 - Rotate API keys regularly; track in `CHANGELOG.md`.
 - Store screenshots/backups under restricted permissions; purge old artifacts.
+- Back up `ENCRYPTION_KEY` (stored in `.env` and `data/.encryption_key`, perms 600 POSIX).
+- Ensure `data/` and subdirs (`logs/`, `backups/`, `screenshots/`) are writable only by the service user.
+
+---
+
+## Startup Validation & Health
+
+### Pre-flight (blocking on start)
+- Required env vars present and non-placeholder (Telegram, Reddit, YouTube, encryption key).
+- Filesystem directories exist and writable: `data/`, `data/logs/`, `data/backups/`, `data/screenshots/`.
+- Disk space warning if <1GB free.
+- Database reachable; SQLite integrity check.
+- Dependency imports validated.
+- Telegram token format checked.
+
+### Startup health verification (blocking)
+- Database: `SELECT 1`, integrity (SQLite), latency warning.
+- Telegram: send test notification (falls back to degraded logging mode if fails).
+- Scheduler: running flag validated.
+- Critical failures exit with code 1 (unless `--skip-validation` used).
+
+### Runtime health (scheduled)
+- Health checks every 5 minutes for database, telegram, disk, memory, platforms.
+- Database unhealthy triggers graceful shutdown to avoid corruption.
+- Degraded optional services (Telegram/adapters/monitoring) log warnings and auto-retry with backoff.
+
+See `docs/HEALTH_CHECKS.md` for full details.
 
 ---
 
@@ -398,9 +427,8 @@ sudo systemctl start referral-automation.service
 
 Docker quickstart:
 ```bash
-docker build -t referral-automation:latest .
-docker-compose up -d   # uses docker-compose.yml for volumes/env/restart policy
-docker-compose logs -f
+docker build -t referral .
+docker run -d --name referral -v $(pwd)/config:/app/config referral
 ```
 
 Windows service (NSSM):

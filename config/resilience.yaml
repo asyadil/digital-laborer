@@ -1,0 +1,15 @@
+resilience:
+  telegram:
+    critical: false
+    retry_interval: 300   # seconds
+    max_retries: 0        # 0 = infinite
+  reddit:
+    critical: false
+    retry_interval: 600
+  youtube:
+    critical: false
+    retry_interval: 600
+  database:
+    critical: true
+    retry_attempts: 3
+    retry_backoff_seconds: 5
