@@ -5,6 +5,7 @@ import json
 import logging
 import logging.handlers
 import os
+import re
 import traceback
 from datetime import datetime
 from typing import Any, Optional
@@ -35,6 +36,34 @@ def _ensure_log_directory(log_file: str) -> None:
 
 def _default_formatter(fmt: str) -> logging.Formatter:
     return logging.Formatter(fmt)
+
+
+class RedactionFilter(logging.Filter):
+    """Redact common secret patterns from log messages."""
+
+    # Simple patterns for tokens/keys/passwords; expand as needed
+    PATTERNS = [
+        re.compile(r"(token|password|secret|key)=([A-Za-z0-9_\-\.\/\+:]{8,})", re.IGNORECASE),
+        re.compile(r"(Bearer\s+)[A-Za-z0-9_\-\.\/\+:]{8,}", re.IGNORECASE),
+    ]
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        redacted = msg
+        for pattern in self.PATTERNS:
+            redacted = pattern.sub(r"\1=***REDACTED***", redacted)
+        # Update the message in-place for handlers/formatters
+        if redacted != msg:
+            record.msg = redacted
+        # Also redact in extra dict if present
+        if hasattr(record, "__dict__"):
+            for key, value in list(record.__dict__.items()):
+                if isinstance(value, str):
+                    new_val = value
+                    for pattern in self.PATTERNS:
+                        new_val = pattern.sub(r"\1=***REDACTED***", new_val)
+                    record.__dict__[key] = new_val
+        return True
 
 
 def _json_formatter(record: logging.LogRecord) -> str:
@@ -75,6 +104,7 @@ def setup_logger(
     logger = logging.getLogger(name)
     logger.setLevel(getattr(logging, level.upper(), logging.INFO))
     logger.propagate = False
+    redaction_filter = RedactionFilter()
 
     formatter: logging.Formatter = JsonFormatter() if json_logs else _default_formatter(log_format)
 
@@ -89,12 +119,14 @@ def setup_logger(
             )
             file_handler.setLevel(getattr(logging, level.upper(), logging.INFO))
             file_handler.setFormatter(formatter)
+            file_handler.addFilter(redaction_filter)
             logger.addHandler(file_handler)
         except OSError as exc:
             # Fall back to console logging if file handler fails
             fallback = logging.StreamHandler()
             fallback.setLevel(getattr(logging, level.upper(), logging.INFO))
             fallback.setFormatter(formatter)
+            fallback.addFilter(redaction_filter)
             logger.addHandler(fallback)
             logger.error(
                 "Failed to attach file handler for logging",
@@ -104,12 +136,14 @@ def setup_logger(
     console_handler = logging.StreamHandler()
     console_handler.setLevel(getattr(logging, level.upper(), logging.INFO))
     console_handler.setFormatter(formatter)
+    console_handler.addFilter(redaction_filter)
     logger.addHandler(console_handler)
 
     if telegram_controller is not None:
         telegram_handler = TelegramLogHandler(telegram_controller=telegram_controller)
         telegram_handler.setFormatter(formatter)
         telegram_handler.setLevel(getattr(logging, level.upper(), logging.INFO))
+        telegram_handler.addFilter(redaction_filter)
         logger.addHandler(telegram_handler)
 
     logger.debug("Logger initialized", extra={"component": "logger", "json_logs": json_logs})

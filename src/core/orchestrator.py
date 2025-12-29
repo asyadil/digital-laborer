@@ -32,6 +32,7 @@ from src.core.account_manager import AccountManager
 from src.core.startup_validation import run_preflight_checks
 from src.core.health_checker_startup import run_startup_health_checks, StartupHealthError
 from src.utils.secrets_manager import SecretsManager
+from src.utils.rate_limiter import TokenBucketRateLimiter
 
 
 class NullTelegram:
@@ -107,6 +108,12 @@ class SystemOrchestrator:
         self.degraded_mode = False
         self._recovery_backoff_seconds = 300
         self._monitoring_disabled = False
+        # Basic per-platform rate limiters (tokens per second, capacity burst)
+        self.platform_limiters: dict[str, TokenBucketRateLimiter] = {
+            "reddit": TokenBucketRateLimiter(rate=1 / 30, capacity=5),   # ~2 per minute burst 5
+            "youtube": TokenBucketRateLimiter(rate=1 / 60, capacity=3),  # ~1 per minute burst 3
+        }
+        self.platform_paused: dict[str, bool] = {}
 
     async def start(self) -> None:
         try:
@@ -669,6 +676,12 @@ class SystemOrchestrator:
                 self.logger.warning(
                     "Service %s degraded", service, extra={"component": "orchestrator"}
                 )
+            if service in {"reddit", "youtube"}:
+                self.platform_paused[service] = True
+        else:
+            if service in {"reddit", "youtube"}:
+                self.platform_paused[service] = False
+            return
 
     def _hydrate_env_secrets(self) -> None:
         """Populate environment variables from secrets manager if missing/placeholder."""
@@ -681,6 +694,10 @@ class SystemOrchestrator:
             "REDDIT_PASSWORD",
             "REDDIT_USER_AGENT",
             "ENCRYPTION_KEY",
+            "YOUTUBE_CLIENT_ID",
+            "YOUTUBE_CLIENT_SECRET",
+            "YOUTUBE_REFRESH_TOKEN",
+            "DATABASE_URL",
         ]
 
         def _is_placeholder(val: str | None) -> bool:
@@ -761,6 +778,21 @@ class SystemOrchestrator:
         quality = post_data.get("quality", {})
         score = quality.get("score", 0.0)
         template_id = post_data.get("template_id")
+        limiter = self.platform_limiters.get(platform)
+        if self.platform_paused.get(platform):
+            self.logger.warning(
+                "Platform %s paused due to degraded health; skipping draft",
+                platform,
+                extra={"component": "orchestrator", "platform": platform},
+            )
+            return None
+        if limiter and not limiter.try_acquire():
+            self.logger.warning(
+                "Rate limit hit for platform %s; skipping draft persistence this tick",
+                platform,
+                extra={"component": "orchestrator", "platform": platform},
+            )
+            return None
         with self.db.session_scope(logger=self.logger) as session:
             post = Post(
                 account_id=None,

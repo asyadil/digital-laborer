@@ -32,6 +32,7 @@ class Scheduler:
         self._wake_event = asyncio.Event()
         self._stopping = False
         self._running = False
+        self._running_tasks: set[str] = set()
 
     def schedule_once(self, name: str, when: datetime, coro_factory: Callable[[], Awaitable[None]]) -> None:
         self._push(name=name, when=when, coro_factory=coro_factory, interval_seconds=None)
@@ -67,6 +68,13 @@ class Scheduler:
                     continue
 
                 heapq.heappop(self._heap)
+                if item.name in self._running_tasks:
+                    # Skip scheduling duplicate concurrent run; reschedule next interval if any
+                    if item.interval_seconds:
+                        next_run = datetime.now(timezone.utc) + timedelta(seconds=item.interval_seconds)
+                        self._push(item.name, next_run, item.coro_factory, item.interval_seconds)
+                    continue
+                self._running_tasks.add(item.name)
                 asyncio.create_task(self._run_item(item), name=f"sched:{item.name}")
 
                 if item.interval_seconds:
@@ -86,6 +94,8 @@ class Scheduler:
                 "Scheduled task failed",
                 extra={"component": "scheduler", "task": item.name, "error": str(exc)},
             )
+        finally:
+            self._running_tasks.discard(item.name)
 
     async def _wait_any(self, stop_event: asyncio.Event, timeout: Optional[float] = None) -> None:
         tasks = [asyncio.create_task(stop_event.wait(), name="sched_stop"), asyncio.create_task(self._wake_event.wait(), name="sched_wake")]
