@@ -13,11 +13,11 @@ import json
 import logging
 import os
 import re
-import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from sqlalchemy import func
 from telegram import (
     InlineKeyboardButton, 
     InlineKeyboardMarkup, 
@@ -36,7 +36,7 @@ from telegram.error import (
 )
 from telegram.ext import ContextTypes
 
-from src.database.models import Account, AccountType, TelegramInteraction
+from src.database.models import Account, AccountType, TelegramInteraction, Post, PostStatus, SystemMetric
 from src.database.operations import DatabaseSessionManager
 from src.utils.rate_limiter import FixedWindowRateLimiter
 from src.utils.validators import sanitize_markdown, validate_email, validate_url
@@ -168,6 +168,82 @@ async def cmd_status(controller, update: Update, context: ContextTypes.DEFAULT_T
         await controller._safe_notify_error("cmd_status", exc)
 
 
+async def cmd_stats(controller, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show aggregated stats for posts and metrics."""
+    try:
+        args = context.args or []
+        timeframe = (args[0].lower() if args else "day").strip()
+        now = datetime.utcnow()
+        if timeframe in {"day", "today"}:
+            since = now - timedelta(days=1)
+            label = "24h"
+        elif timeframe in {"week", "7d"}:
+            since = now - timedelta(days=7)
+            label = "7d"
+        elif timeframe in {"month", "30d"}:
+            since = now - timedelta(days=30)
+            label = "30d"
+        else:
+            since = None
+            label = "all-time"
+
+        with controller.db.session_scope() as session:
+            posted_query = session.query(Post.platform, func.count(Post.id)).filter(Post.status == PostStatus.POSTED)
+            pending_query = session.query(Post.platform, func.count(Post.id)).filter(Post.status == PostStatus.PENDING)
+            if since:
+                posted_query = posted_query.filter(Post.created_at >= since)
+                pending_query = pending_query.filter(Post.created_at >= since)
+            posted = {row[0]: row[1] for row in posted_query.group_by(Post.platform)}
+            pending = {row[0]: row[1] for row in pending_query.group_by(Post.platform)}
+
+            # System metrics (optional)
+            metrics = {}
+            if since:
+                metric_rows = (
+                    session.query(SystemMetric.metric_type, func.avg(SystemMetric.value))
+                    .filter(SystemMetric.timestamp >= since)
+                    .group_by(SystemMetric.metric_type)
+                    .all()
+                )
+                metrics = {row[0]: round(float(row[1]), 3) for row in metric_rows}
+
+        lines = [
+            f"📊 *Stats* ({label})",
+            "• Posted per platform:",
+        ]
+        if posted:
+            for plat, count in posted.items():
+                lines.append(f"  - {plat}: {count}")
+        else:
+            lines.append("  - none")
+        lines.append("• Pending per platform:")
+        if pending:
+            for plat, count in pending.items():
+                lines.append(f"  - {plat}: {count}")
+        else:
+            lines.append("  - none")
+        if metrics:
+            lines.append("• Metrics (avg):")
+            for mtype, val in metrics.items():
+                lines.append(f"  - {mtype}: {val}")
+
+        keyboard = [
+            [InlineKeyboardButton("24h", callback_data="stats day"), InlineKeyboardButton("7d", callback_data="stats week")],
+            [InlineKeyboardButton("30d", callback_data="stats month"), InlineKeyboardButton("All", callback_data="stats all")],
+            [InlineKeyboardButton("🔄 Refresh", callback_data="stats")],
+        ]
+
+        await controller._send_text(
+            update.effective_chat.id,
+            "\n".join(lines),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+    except Exception as exc:
+        controller.logger.error(f"Error in stats command: {exc}", exc_info=True)
+        await controller._safe_notify_error("cmd_stats", exc)
+
+
 async def cmd_pause(controller, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         controller.paused = True
@@ -182,6 +258,125 @@ async def cmd_resume(controller, update: Update, context: ContextTypes.DEFAULT_T
         await controller._send_text(update.effective_chat.id, "Resumed automation.", parse_mode=ParseMode.MARKDOWN_V2)
     except Exception as exc:
         await controller._safe_notify_error("cmd_resume", exc)
+
+
+async def cmd_config(controller, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """View or update a limited set of runtime configs (in-memory, non-persistent)."""
+    try:
+        args = context.args or []
+        if not args:
+            await controller._send_text(
+                update.effective_chat.id,
+                "Usage: /config <key> [value]\nAllowed keys: logging.level, monitoring.health_check_interval, retry.base_delay, retry.max_delay",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+            return
+
+        key = args[0]
+        value = args[1] if len(args) > 1 else None
+
+        # Whitelist of allowed keys mapped to (object, attr)
+        allowed = {
+            "logging.level": ("logging", "level"),
+            "monitoring.health_check_interval": ("monitoring", "health_check_interval"),
+            "retry.base_delay": ("retry", "base_delay"),
+            "retry.max_delay": ("retry", "max_delay"),
+        }
+        if key not in allowed:
+            await controller._send_text(
+                update.effective_chat.id,
+                f"❌ Unsupported key `{key}`.\nAllowed: {', '.join(allowed.keys())}",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+            return
+
+        section_name, attr_name = allowed[key]
+        section = getattr(controller.config, section_name, None)
+        if section is None:
+            await controller._send_text(
+                update.effective_chat.id,
+                f"❌ Config section `{section_name}` not found.",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+            return
+
+        if value is None:
+            current = getattr(section, attr_name, "N/A")
+            await controller._send_text(
+                update.effective_chat.id,
+                f"ℹ️ `{key}` = `{current}`",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+            return
+
+        # Cast value based on existing type
+        current_val = getattr(section, attr_name, None)
+        new_val = value
+        try:
+            if isinstance(current_val, bool):
+                new_val = value.lower() in {"1", "true", "yes", "on"}
+            elif isinstance(current_val, int):
+                new_val = int(value)
+            else:
+                new_val = value
+        except Exception as exc:
+            await controller._send_text(
+                update.effective_chat.id,
+                f"❌ Invalid value for `{key}`: {value} ({exc})",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+            return
+
+        setattr(section, attr_name, new_val)
+        await controller._send_text(
+            update.effective_chat.id,
+            f"✅ Updated `{key}` to `{new_val}` (in-memory).",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+    except Exception as exc:
+        controller.logger.error(f"Error in config command: {exc}", exc_info=True)
+        await controller._safe_notify_error("cmd_config", exc)
+
+
+async def cmd_daily_summary(controller, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send a quick daily summary (uses existing metrics/posts)."""
+    try:
+        now = datetime.utcnow()
+        since = now - timedelta(days=1)
+        with controller.db.session_scope() as session:
+            posted = (
+                session.query(Post.platform, func.count(Post.id))
+                .filter(Post.status == PostStatus.POSTED)
+                .filter(Post.created_at >= since)
+                .group_by(Post.platform)
+                .all()
+            )
+            pending = (
+                session.query(Post.platform, func.count(Post.id))
+                .filter(Post.status == PostStatus.PENDING)
+                .filter(Post.created_at >= since)
+                .group_by(Post.platform)
+                .all()
+            )
+        lines = ["📈 *Daily Summary (24h)*"]
+        if posted:
+            lines.append("• Posted:")
+            for plat, cnt in posted:
+                lines.append(f"  - {plat}: {cnt}")
+        else:
+            lines.append("• Posted: none")
+        if pending:
+            lines.append("• Pending drafts:")
+            for plat, cnt in pending:
+                lines.append(f"  - {plat}: {cnt}")
+        await controller._send_text(
+            update.effective_chat.id,
+            "\n".join(lines),
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+    except Exception as exc:
+        controller.logger.error(f"Error in daily_summary command: {exc}", exc_info=True)
+        await controller._safe_notify_error("cmd_daily_summary", exc)
 
 
 async def cmd_logs(controller, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

@@ -125,9 +125,14 @@ class TelegramController:
         # Command handlers
         app.add_handler(CommandHandler("help", lambda u, c: self._authorized(handlers.cmd_help, u, c)))
         app.add_handler(CommandHandler("status", lambda u, c: self._authorized(handlers.cmd_status, u, c)))
+        app.add_handler(CommandHandler("stats", lambda u, c: self._authorized(handlers.cmd_stats, u, c)))
         app.add_handler(CommandHandler("pause", lambda u, c: self._authorized(handlers.cmd_pause, u, c)))
         app.add_handler(CommandHandler("resume", lambda u, c: self._authorized(handlers.cmd_resume, u, c)))
         app.add_handler(CommandHandler("logs", lambda u, c: self._authorized(handlers.cmd_logs, u, c)))
+        # Runtime config update (simple key/value)
+        app.add_handler(CommandHandler("config", lambda u, c: self._authorized(handlers.cmd_config, u, c)))
+        app.add_handler(CommandHandler("daily_summary", lambda u, c: self._authorized(handlers.cmd_daily_summary, u, c)))
+        # Help: show commands
         
         # Action handlers
         app.add_handler(CommandHandler("approve", lambda u, c: self._authorized(handlers.cmd_approve, u, c)))
@@ -351,11 +356,13 @@ class TelegramController:
             timeout=timed_out,
         )
 
-    async def resolve_action(self, action_id: str, response_type: str, response_value: Optional[str], source: str) -> None:
+    async def resolve_action(self, action_id: str, response_type: str, response_value: Optional[str], source: str) -> Dict[str, Any]:
         """Resolve a pending action (from command/callback)."""
         fut = self._pending_futures.get(action_id)
         if fut is not None and not fut.done():
             fut.set_result({"response_type": response_type, "response_value": response_value, "source": source})
+            return {"success": True}
+        return {"success": False, "error": "action_not_found_or_already_completed"}
 
     async def send_notification(
         self,

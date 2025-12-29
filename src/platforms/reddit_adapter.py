@@ -40,6 +40,8 @@ class RedditAdapter(BasePlatformAdapter):
         self.db_session = db_session
         # PRAW allows fairly generous limits, but we enforce a conservative client-side limit.
         self.rate_limiter = FixedWindowRateLimiter(max_calls=55, window_seconds=60.0)
+        # Posting limiter (stricter to avoid bans)
+        self.post_rate_limiter = FixedWindowRateLimiter(max_calls=15, window_seconds=60.0)
         self._client: Any = None
         self._logged_in_as: Optional[str] = None
         self._current_account_id: Optional[int] = None
@@ -348,6 +350,18 @@ class RedditAdapter(BasePlatformAdapter):
                 if not login_result.success:
                     return login_result
             self._human_jitter()
+
+            # Rotate UA/proxy per post attempt for variance
+            self._rotate_identity(preferred_ua=None)
+
+            # Client-side posting rate limit
+            if not self.post_rate_limiter.try_acquire():
+                return AdapterResult(
+                    success=False,
+                    error="Local rate limit hit; retry later",
+                    retry_recommended=True,
+                    data={"rotate_account": True},
+                )
             
             if not target_id:
                 raise ValueError("target_id is required")
@@ -384,12 +398,34 @@ class RedditAdapter(BasePlatformAdapter):
                     }
                 
                 start = time.monotonic()
-                res = self._call_with_limits(_op)
+                res = self._call_with_limits(_op, timeout_seconds=20.0)
                 self._log_duration("post_comment", start)
                 
                 # Update account health on success
                 if self._current_account_id:
                     self._update_account_health(self._current_account_id, True)
+
+                # Verify visibility (best-effort). If body missing, mark warning but do not fail hard (to avoid false negatives).
+                visibility_warning = False
+                try:
+                    if not res.get("duplicate"):
+                        comment_id = res.get("comment_id")
+                        if comment_id:
+                            comment = self._client.comment(id=comment_id)
+                            comment.refresh()
+                            body = getattr(comment, "body", "") or ""
+                            if not body.strip():
+                                visibility_warning = True
+                                self.logger.warning(
+                                    "Comment visibility uncertain (empty body after refresh)",
+                                    extra={"component": "reddit_adapter", "comment_id": comment_id},
+                                )
+                except Exception as vis_exc:
+                    visibility_warning = True
+                    self.logger.warning(
+                        "Comment visibility check failed",
+                        extra={"component": "reddit_adapter", "error": str(vis_exc)},
+                    )
                 
                 return AdapterResult(
                     success=True, 
@@ -398,6 +434,7 @@ class RedditAdapter(BasePlatformAdapter):
                         "account_id": self._current_account_id,
                         "username": self._logged_in_as,
                         "duration_ms": round((time.monotonic() - start) * 1000, 2),
+                        "visibility_warning": visibility_warning,
                     }
                 )
                 
@@ -405,6 +442,7 @@ class RedditAdapter(BasePlatformAdapter):
                 error_msg = f"Error posting comment: {str(e)}"
                 self.logger.error(error_msg, exc_info=True)
                 code, backoff = self._categorize_error(e)
+                shot = self._capture_screenshot_safe("post_comment_error")
                 
                 # Update account health on failure
                 if self._current_account_id:
@@ -412,7 +450,6 @@ class RedditAdapter(BasePlatformAdapter):
                 
                 # If we got rate limited, signal retry/rotate to caller
                 if "RATELIMIT" in str(e).upper():
-                    shot = self._capture_screenshot_safe("ratelimit")
                     return AdapterResult(
                         success=False,
                         error=error_msg,
@@ -431,7 +468,12 @@ class RedditAdapter(BasePlatformAdapter):
                     success=False, 
                     error=error_msg, 
                     retry_recommended=not isinstance(e, AuthenticationError),
-                    data={"error_code": code, "backoff_seconds": backoff},
+                    data={
+                        "error_code": code,
+                        "backoff_seconds": backoff,
+                        "rotate_account": code in {"rate_limit", "ban_suspected"},
+                        "screenshot": shot,
+                    },
                 )
                 
         except Exception as exc:
@@ -750,8 +792,13 @@ class RedditAdapter(BasePlatformAdapter):
         return "unknown", None
 
     @retry_with_exponential_backoff(max_attempts=3, base_delay=1.0, max_delay=15.0)
-    def _call_with_limits(self, func):
+    def _call_with_limits(self, func, timeout_seconds: float = 30.0):
         # Client-side rate limiter
         if not self.rate_limiter.try_acquire():
             raise RateLimitError("Client-side rate limit exceeded")
-        return func()
+        start = time.monotonic()
+        result = func()
+        elapsed = time.monotonic() - start
+        if elapsed > timeout_seconds:
+            raise TimeoutError(f"Operation exceeded timeout {timeout_seconds}s (elapsed {elapsed:.2f}s)")
+        return result
