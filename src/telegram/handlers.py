@@ -40,6 +40,7 @@ from src.database.models import Account, AccountType, TelegramInteraction, Post,
 from src.database.operations import DatabaseSessionManager
 from src.utils.rate_limiter import FixedWindowRateLimiter
 from src.utils.validators import sanitize_markdown, validate_email, validate_url
+from src.monitoring.analytics import Analytics
 
 
 def _format_kv(title: str, value: Any, max_length: int = 200) -> str:
@@ -377,6 +378,44 @@ async def cmd_daily_summary(controller, update: Update, context: ContextTypes.DE
     except Exception as exc:
         controller.logger.error(f"Error in daily_summary command: {exc}", exc_info=True)
         await controller._safe_notify_error("cmd_daily_summary", exc)
+
+
+async def cmd_pending(controller, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List pending human actions with age."""
+    try:
+        args = context.args or []
+        limit = 20
+        if args:
+            try:
+                limit = max(5, min(int(args[0]), 50))
+            except ValueError:
+                pass
+        with controller.db.session_scope(logger=controller.logger) as session:
+            rows = (
+                session.query(TelegramInteraction)
+                .filter(TelegramInteraction.responded_at.is_(None))
+                .order_by(TelegramInteraction.requested_at.asc())
+                .limit(limit)
+                .all()
+            )
+        if not rows:
+            await controller._send_text(update.effective_chat.id, "✅ No pending actions.", parse_mode=ParseMode.MARKDOWN_V2)
+            return
+        lines = ["🕒 *Pending Actions*"]
+        now = datetime.utcnow()
+        for row in rows:
+            ctx = row.context or {}
+            action_id = ctx.get("action_id", "n/a")
+            age_min = max(0, int((now - row.requested_at).total_seconds() // 60))
+            lines.append(f"- `{action_id}` {sanitize_markdown(row.action_type)} · {age_min}m ago")
+        await controller._send_text(
+            update.effective_chat.id,
+            "\n".join(lines),
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+    except Exception as exc:
+        controller.logger.error(f"Error in pending command: {exc}", exc_info=True)
+        await controller._safe_notify_error("cmd_pending", exc)
 
 
 async def cmd_logs(controller, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

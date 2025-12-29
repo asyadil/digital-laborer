@@ -4,7 +4,7 @@ import os
 from dotenv import load_dotenv
 
 def setup_reddit_oauth():
-    print("=== Reddit OAuth Setup ===")
+    print("=== Reddit OAuth Setup ===\t")
     print("1. Go to https://www.reddit.com/prefs/apps")
     print("2. Click 'create app' or 'create another app'")
     print("3. Select 'script' type")

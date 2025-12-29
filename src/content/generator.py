@@ -41,6 +41,7 @@ class ContentGenerator:
         self.scorer = QualityScorer(
             min_length=int(getattr(config.content, "min_length", 200)),
             max_length=int(getattr(config.content, "max_length", 800)),
+            min_sections=3,
         )
         self.referral_links = referral_links or []
 
@@ -91,6 +92,52 @@ class ContentGenerator:
             min_words=800,
             max_words=2000,
         )
+
+    def generate_long_form_article(
+        self,
+        topic: str,
+        platform: str = "generic",
+        audience: str = "beginner",
+        tone: str = "practical",
+        min_words: int = 1200,
+        max_words: int = 2200,
+    ) -> Dict[str, Any]:
+        """Generate long-form content with structured sections and CTA."""
+        outline = [
+            "## Hook & Context",
+            "## What to know first",
+            "## Step-by-step",
+            "## Common pitfalls",
+            "## Metrics & proof",
+            "## Next steps / CTA",
+        ]
+        ctx = {
+            "topic": topic,
+            "audience": audience,
+            "tone": tone,
+            "outline": outline,
+            "cta": "If you want the full toolkit + templates I used, reply and I’ll share privately.",
+            "referral_link": self._default_referral_link(platform) or self._default_referral_link("generic"),
+        }
+        sections = self._build_long_form_sections(ctx)
+        raw = "\n\n".join(sections)
+        # Slight paraphrase for variation
+        try:
+            raw = self.paraphraser.paraphrase(raw, intensity=0.25).paraphrased
+        except Exception:
+            pass
+        # Enforce length & sanitize
+        normalized = self._normalize_whitespace(raw)
+        trimmed = self._enforce_word_range(normalized, min_words=min_words, max_words=max_words)
+        qa = self.scorer.assess(trimmed)
+        return {
+            "platform": platform,
+            "content": self._sanitize_output(trimmed),
+            "quality": {"score": qa.score, "breakdown": qa.breakdown, "suggestions": qa.suggestions},
+            "template_id": "long_form_structured",
+            "errors": [],
+            "warnings": [],
+        }
 
     def paraphrase_content(self, text: str, intensity: float = 0.5) -> Dict[str, Any]:
         res = self.paraphraser.paraphrase(text, intensity=intensity)
@@ -284,6 +331,51 @@ class ContentGenerator:
         conclusion_block = f"{conclusion}\n- Recap main actionable\n- Next step for reader\n- Offer to share more resources on request\n{context.get('cta','')}\n"
 
         return "\n".join([intro_block.strip(), body_block.strip(), conclusion_block.strip()])
+
+    def _build_long_form_sections(self, context: Dict[str, Any]) -> List[str]:
+        topic = context.get("topic", "")
+        audience = context.get("audience", "reader")
+        tone = context.get("tone", "practical")
+        outline: List[str] = context.get("outline") or []
+        referral = context.get("referral_link")
+
+        def para(seed: int, core: str) -> str:
+            rng = random.Random(seed)
+            additions = [
+                "Keep a simple log and measure progress weekly.",
+                "Use one metric to decide if the step works.",
+                "Avoid over-optimizing before you get signal.",
+                "Share a small win to build trust before any link.",
+            ]
+            return core + " " + rng.choice(additions)
+
+        sections: List[str] = []
+        for idx, heading in enumerate(outline):
+            base = f"{heading}\n"
+            if "Hook" in heading:
+                base += para(idx, f"{topic} matters for {audience}. Set expectations and choose a scope you can ship in 7-10 days.")
+            elif "What to know" in heading:
+                base += para(idx, f"Clarify constraints (time, budget, risk). Tone: {tone}. State assumptions plainly.")
+            elif "Step-by-step" in heading:
+                base += (
+                    "- Step 1: Define the target outcome and one metric\n"
+                    "- Step 2: Run a small test with a single channel\n"
+                    "- Step 3: Inspect results, adjust copy, and iterate\n"
+                )
+            elif "pitfalls" in heading:
+                base += (
+                    "- Chasing too many channels at once\n"
+                    "- Adding links before trust is built\n"
+                    "- Ignoring signals (bounce, replies, downvotes)\n"
+                )
+            elif "Metrics" in heading:
+                base += "Track 3 metrics: reach, engagement, conversion. Include a 7-day and 30-day snapshot."
+                if referral:
+                    base += f"\nMention resource lightly (e.g., {self._sanitize_link(referral)})."
+            elif "Next steps" in heading:
+                base += para(idx, context.get("cta", "Invite readers to ask for the playbook or template."))
+            sections.append(base.strip())
+        return sections
 
     def _sanitize_link(self, link: str) -> str:
         return re.sub(r"[\\s<>\"']", "", link).strip()

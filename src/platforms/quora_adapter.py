@@ -36,7 +36,7 @@ from src.platforms.base_adapter import (
     RateLimitError,
 )
 from src.platforms.selenium_session import SeleniumSession, SeleniumSessionConfig
-from src.utils.rate_limiter import FixedWindowRateLimiter
+from src.utils.rate_limiter import FixedWindowRateLimiter, TokenBucketRateLimiter
 from src.platforms.captcha_handler import CaptchaHandler
 from src.utils.retry import retry_with_exponential_backoff
 from src.utils.user_agents import pick_random_user_agent
@@ -50,6 +50,7 @@ class QuoraAdapter(BasePlatformAdapter):
         super().__init__(config=config, logger=logger, telegram=telegram)
         self.credentials = credentials
         self.rate_limiter = FixedWindowRateLimiter(max_calls=50, window_seconds=3600)  # 50 requests/hour
+        self.answer_rate_limiter = TokenBucketRateLimiter(rate=1 / 45, capacity=3)  # ~1 per 45s burst 3
         self._session: Optional[SeleniumSession] = None
         self._logged_in_as: Optional[str] = None
         self._browser_type = config.get('browser', 'chrome')
@@ -676,10 +677,22 @@ class QuoraAdapter(BasePlatformAdapter):
                 login_result = self.login(account)
                 if not login_result.success:
                     return login_result
+            # Rotate identity per attempt for variance
+            self._rotate_identity()
             
             with self.rate_limiter:
+                if not self.answer_rate_limiter.try_acquire():
+                    return AdapterResult(
+                        success=False,
+                        data={"question_url": question_url},
+                        error="Local rate limit hit; retry later",
+                        retry_recommended=True,
+                    )
+
                 # Navigate to the question page
                 self._session.driver.get(question_url)
+                self._human_pause()
+                self._scroll_to_bottom()
                 start = time.monotonic()
                 
                 # Wait for answer box
@@ -728,6 +741,29 @@ class QuoraAdapter(BasePlatformAdapter):
                 
                 if not answer_id:
                     raise PlatformAdapterError("Failed to post answer: Could not determine answer ID")
+
+                # Visibility check (best-effort)
+                visibility_warning = False
+                try:
+                    self._session.driver.get(answer_url)
+                    self._human_pause()
+                    content_el = self._session.driver.find_element(
+                        By.CSS_SELECTOR,
+                        'div.answer_content div[data-testid="answer_content"]',
+                    )
+                    body_text = content_el.text.strip()
+                    if len(body_text) < 50:
+                        visibility_warning = True
+                        self.logger.warning(
+                            "Quora answer visibility uncertain (short body)",
+                            extra={"component": "quora_adapter", "answer_url": answer_url},
+                        )
+                except Exception as vis_exc:
+                    visibility_warning = True
+                    self.logger.warning(
+                        "Visibility check failed",
+                        extra={"component": "quora_adapter", "error": str(vis_exc), "answer_url": answer_url},
+                    )
                 
                 return AdapterResult(
                     success=True,
@@ -736,6 +772,7 @@ class QuoraAdapter(BasePlatformAdapter):
                         'url': answer_url,
                         'question_url': question_url,
                         'duration_ms': round((time.monotonic() - start) * 1000, 2),
+                        'visibility_warning': visibility_warning,
                     }
                 )
                 
@@ -747,7 +784,12 @@ class QuoraAdapter(BasePlatformAdapter):
             shot = self._capture_screenshot_safe("quora_post_error")
             return AdapterResult(
                 success=False, 
-                data={"question_url": question_url, "screenshot": shot} if shot else {"question_url": question_url}, 
+                data={
+                    "question_url": question_url,
+                    "screenshot": shot,
+                    "rotate_account": True,
+                    "backoff_seconds": 60,
+                }, 
                 error=str(exc), 
                 retry_recommended=not isinstance(exc, (AuthenticationError, AntiBotChallengeError))
             )

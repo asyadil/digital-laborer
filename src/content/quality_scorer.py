@@ -46,10 +46,12 @@ class QualityScorer:
         min_length: int = 200,
         max_length: int = 800,
         max_links: int = 2,
+        min_sections: int = 3,
     ) -> None:
         self.min_length = min_length
         self.max_length = max_length
         self.max_links = max_links
+        self.min_sections = min_sections
 
     def assess(self, content: str) -> QualityAssessment:
         if content is None:
@@ -64,6 +66,10 @@ class QualityScorer:
         flow_score, flow_suggestions = self._flow_score(content)
         link_score, link_suggestions = self._link_placement_score(content, links)
         readability_score, read_suggestions = self._readability_score(content)
+        structure_score, structure_suggestions = self._structure_score(content)
+        evidence_score, evidence_suggestions = self._evidence_score(content)
+        cta_score, cta_suggestions = self._cta_score(content)
+        diversity_score, diversity_suggestions = self._diversity_score(words)
 
         breakdown = {
             "length": length_score,
@@ -71,18 +77,35 @@ class QualityScorer:
             "flow": flow_score,
             "link_placement": link_score,
             "readability": readability_score,
+            "structure": structure_score,
+            "evidence": evidence_score,
+            "cta": cta_score,
+            "diversity": diversity_score,
         }
 
-        # Weights per spec: length 0.2, spam 0.3, flow 0.2, link placement 0.2, readability 0.1
+        # Weights (sum=1): length 0.15, spam 0.2, flow 0.15, link 0.1, readability 0.1, structure 0.1, evidence 0.1, cta 0.05, diversity 0.05
         total = (
-            0.2 * length_score
-            + 0.3 * spam_score
-            + 0.2 * flow_score
-            + 0.2 * link_score
+            0.15 * length_score
+            + 0.2 * spam_score
+            + 0.15 * flow_score
+            + 0.1 * link_score
             + 0.1 * readability_score
+            + 0.1 * structure_score
+            + 0.1 * evidence_score
+            + 0.05 * cta_score
+            + 0.05 * diversity_score
         )
 
-        suggestions = spam_suggestions + flow_suggestions + link_suggestions + read_suggestions
+        suggestions = (
+            spam_suggestions
+            + flow_suggestions
+            + link_suggestions
+            + read_suggestions
+            + structure_suggestions
+            + evidence_suggestions
+            + cta_suggestions
+            + diversity_suggestions
+        )
         total = max(0.0, min(1.0, float(total)))
 
         return QualityAssessment(score=total, breakdown=breakdown, suggestions=suggestions)
@@ -211,4 +234,49 @@ class QualityScorer:
 
         # Smooth score peak near 18
         score = 1.0 - min(0.4, abs(avg_words - 18) / 30)
+        return max(0.0, score), suggestions
+
+    def _structure_score(self, content: str) -> tuple[float, List[str]]:
+        suggestions: List[str] = []
+        lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
+        if not lines:
+            return 0.0, ["Add headings or bullets to structure the content"]
+        heading_like = sum(1 for ln in lines if ln.startswith(("#", "##", "###", "- ", "* ", "•")))
+        section_count = max(heading_like, content.count("\n\n") + 1)
+        score = 1.0
+        if section_count < self.min_sections:
+            score -= 0.2
+            suggestions.append(f"Add at least {self.min_sections} sections/bullets for clarity")
+        if heading_like == 0:
+            score -= 0.1
+            suggestions.append("Use headings or bullet points for scannability")
+        return max(0.0, score), suggestions
+
+    def _evidence_score(self, content: str) -> tuple[float, List[str]]:
+        suggestions: List[str] = []
+        numbers = re.findall(r"\d+[%]?", content)
+        score = 1.0
+        if not numbers:
+            score -= 0.2
+            suggestions.append("Cite at least one metric, timeframe, or numeric example")
+        return max(0.0, score), suggestions
+
+    def _cta_score(self, content: str) -> tuple[float, List[str]]:
+        suggestions: List[str] = []
+        lowered = content.lower()
+        has_cta = any(kw in lowered for kw in ["cta", "call to action", "next step", "let me know", "dm", "reach out", "ask me", "comment"])
+        score = 1.0 if has_cta else 0.6
+        if not has_cta:
+            suggestions.append("Add a gentle call-to-action or next step for the reader")
+        return max(0.0, score), suggestions
+
+    def _diversity_score(self, words: List[str]) -> tuple[float, List[str]]:
+        suggestions: List[str] = []
+        if not words:
+            return 0.0, ["Add more content"]
+        unique = len(set(w.lower() for w in words))
+        ratio = unique / max(1, len(words))
+        score = min(1.0, 0.5 + ratio)  # reward variety
+        if ratio < 0.4 and len(words) > 80:
+            suggestions.append("Increase vocabulary variety; reduce repetition")
         return max(0.0, score), suggestions

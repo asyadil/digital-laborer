@@ -29,7 +29,7 @@ from src.platforms.base_adapter import (
     PlatformAdapterError,
     RateLimitError,
 )
-from src.utils.rate_limiter import FixedWindowRateLimiter
+from src.utils.rate_limiter import FixedWindowRateLimiter, TokenBucketRateLimiter
 from src.utils.retry import retry_with_exponential_backoff
 from src.platforms.captcha_handler import CaptchaHandler
 from src.utils.user_agents import pick_random_user_agent
@@ -41,6 +41,7 @@ class YouTubeAdapter(BasePlatformAdapter):
         self.credentials = credentials
         # YouTube Data API v3 has a quota cost of 1 unit per read, 50 units per write
         self.rate_limiter = FixedWindowRateLimiter(max_calls=9000, window_seconds=86400)  # Daily quota
+        self.comment_rate_limiter = TokenBucketRateLimiter(rate=1 / 30, capacity=5)  # ~2 per minute burst 5
         self._client = None
         self._logged_in_as = None
         self._service = None
@@ -71,7 +72,7 @@ class YouTubeAdapter(BasePlatformAdapter):
             self.logger.error("Failed to create YouTube client", extra={"error": str(exc)})
             raise AuthenticationError(f"YouTube authentication failed: {str(exc)}")
 
-    def _call_with_limits(self, func, *args, **kwargs):
+    def _call_with_limits(self, func, *args, timeout_seconds: float = 30.0, **kwargs):
         """Wrapper to handle rate limiting and retries for API calls."""
         @retry_with_exponential_backoff(
             max_attempts=3,
@@ -81,7 +82,12 @@ class YouTubeAdapter(BasePlatformAdapter):
         def _wrapped():
             with self.rate_limiter:
                 try:
-                    return func(*args, **kwargs)
+                    start = time.monotonic()
+                    result = func(*args, **kwargs)
+                    elapsed = time.monotonic() - start
+                    if elapsed > timeout_seconds:
+                        raise TimeoutError(f"YouTube call exceeded {timeout_seconds}s (elapsed {elapsed:.2f}s)")
+                    return result
                 except HttpError as e:
                     if e.resp.status == 403 and 'quotaExceeded' in str(e):
                         raise RateLimitError("YouTube API quota exceeded")
@@ -232,6 +238,15 @@ class YouTubeAdapter(BasePlatformAdapter):
             if not self._service:
                 raise AuthenticationError("Not authenticated with YouTube")
             self._human_pause()
+
+            # Client-side comment limiter
+            if not self.comment_rate_limiter.try_acquire():
+                return AdapterResult(
+                    success=False,
+                    error="Local rate limit hit; retry later",
+                    retry_recommended=True,
+                    data={"rotate_account": True},
+                )
             
             if not video_id:
                 raise ValueError("video_id is required")
@@ -251,19 +266,24 @@ class YouTubeAdapter(BasePlatformAdapter):
             }
             
             start = time.monotonic()
-            response = self._call_with_limits(
+            comment_response = self._call_with_limits(
                 self._service.commentThreads().insert,
                 part='snippet',
-                body=comment_body
+                body=comment_body,
+                timeout_seconds=20.0,
             )
             
-            comment_id = response['id']
+            # Validate response
+            if 'id' not in comment_response:
+                raise PlatformAdapterError("YouTube comment response missing ID")
+            
+            comment_id = comment_response['id']
             comment_url = f"https://www.youtube.com/watch?v={video_id}&lc={comment_id}"
             
             return AdapterResult(
                 success=True,
                 data={
-                    'comment_id': comment_id,
+                    "comment_id": comment_id,
                     'comment_url': comment_url,
                     'duration_ms': round((time.monotonic() - start) * 1000, 2),
                 }

@@ -6,9 +6,10 @@ import json
 import logging
 import os
 import uuid
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Union
+import itertools
 
 from telegram import (
     InlineKeyboardButton, 
@@ -53,6 +54,17 @@ class HumanInputResult:
     timeout: bool
 
 
+@dataclass(order=True)
+class _NotificationItem:
+    priority: int
+    seq: int
+    message: str = field(compare=False)
+    priority_label: str = field(compare=False, default="INFO")
+    attachments: Optional[list[str]] = field(compare=False, default=None)
+    reply_markup: Optional[Any] = field(compare=False, default=None)
+    attempts: int = field(compare=False, default=0)
+
+
 class TelegramController:
     """Telegram bot controller.
 
@@ -83,9 +95,11 @@ class TelegramController:
             max_calls=int(getattr(config.telegram, "max_messages_per_minute", 20)),
             window_seconds=60.0,
         )
-        self._notification_queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue()
+        self._notification_queue: asyncio.PriorityQueue[_NotificationItem] = asyncio.PriorityQueue()
         self._pending_futures: dict[str, asyncio.Future] = {}
         self._stop_event = asyncio.Event()
+        self._notif_seq = itertools.count()
+        self._background_tasks: list[asyncio.Task] = []
 
     @property
     def pending_actions_count(self) -> int:
@@ -106,6 +120,11 @@ class TelegramController:
             await self._app.start()
             await self._app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
 
+            # Background escalation monitor
+            self._background_tasks.append(
+                asyncio.create_task(self._escalation_worker(), name="telegram_escalation_worker")
+            )
+
             await self.send_notification("System started successfully", priority="INFO")
 
             await self._stop_event.wait()
@@ -114,6 +133,8 @@ class TelegramController:
             await self._app.stop()
             await self._app.shutdown()
             queue_task.cancel()
+            for t in self._background_tasks:
+                t.cancel()
         except Exception as exc:
             self.logger.exception("Failed to start Telegram controller", extra={"component": "telegram"})
             raise exc
@@ -132,6 +153,8 @@ class TelegramController:
         # Runtime config update (simple key/value)
         app.add_handler(CommandHandler("config", lambda u, c: self._authorized(handlers.cmd_config, u, c)))
         app.add_handler(CommandHandler("daily_summary", lambda u, c: self._authorized(handlers.cmd_daily_summary, u, c)))
+        app.add_handler(CommandHandler("pending", lambda u, c: self._authorized(handlers.cmd_pending, u, c)))
+        app.add_handler(CommandHandler("report", lambda u, c: self._authorized(handlers.cmd_report, u, c)))
         # Help: show commands
         
         # Action handlers
@@ -164,6 +187,52 @@ class TelegramController:
             await handler_func(self, update, context)
         except Exception as exc:
             await self._safe_notify_error("authorized_handler", exc)
+
+    def _priority_value_from_label(self, label: str) -> int:
+        label_upper = (label or "INFO").upper()
+        if label_upper in {"CRITICAL", "ALERT"}:
+            return 0
+        if label_upper in {"ERROR", "WARN", "WARNING"}:
+            return 1
+        return 2
+
+    async def _escalation_worker(self, interval_seconds: int = 300, stale_seconds: int = 900) -> None:
+        """Periodically check for stale pending actions and backlog to escalate."""
+        while not self._stop_event.is_set():
+            try:
+                await asyncio.sleep(interval_seconds)
+                now = datetime.utcnow()
+                stale_before = now - timedelta(seconds=stale_seconds)
+                with self.db.session_scope(logger=self.logger) as session:
+                    rows = (
+                        session.query(TelegramInteraction)
+                        .filter(TelegramInteraction.responded_at.is_(None))
+                        .filter(TelegramInteraction.requested_at <= stale_before)
+                        .order_by(TelegramInteraction.requested_at.asc())
+                        .limit(10)
+                        .all()
+                    )
+                if rows:
+                    lines = ["⏰ *Pending actions waiting too long:*"]
+                    for row in rows:
+                        ctx = row.context or {}
+                        action_id = ctx.get("action_id", "n/a")
+                        lines.append(f"- {sanitize_markdown(row.action_type)} `{action_id}` since {row.requested_at}")
+                    await self.send_notification("\n".join(lines), priority="WARN")
+
+                backlog = self._notification_queue.qsize()
+                if backlog > 20:
+                    await self.send_notification(
+                        f"⚠️ Telegram queue backlog high: {backlog} items", priority="WARN", priority_value=0
+                    )
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                self.logger.error(
+                    "Escalation worker error",
+                    extra={"component": "telegram", "error": str(exc)},
+                )
+                continue
 
     async def request_human_input(self, action_type: str, context: Dict[str, Any], timeout: int = 3600) -> HumanInputResult:
         """Request human input and wait for response (blocking)."""
@@ -370,16 +439,20 @@ class TelegramController:
         priority: str = "INFO",
         attachments: Optional[list[str]] = None,
         reply_markup: Optional[InlineKeyboardMarkup] = None,
+        priority_value: Optional[int] = None,
     ) -> None:
         """Queue a notification for sending. Non-blocking."""
         try:
+            prio_val = priority_value if priority_value is not None else self._priority_value_from_label(priority)
             await self._notification_queue.put(
-                {
-                    "message": message,
-                    "priority": priority,
-                    "attachments": attachments,
-                    "reply_markup": reply_markup,
-                }
+                _NotificationItem(
+                    priority=prio_val,
+                    seq=next(self._notif_seq),
+                    message=message,
+                    priority_label=priority,
+                    attachments=attachments,
+                    reply_markup=reply_markup,
+                )
             )
         except Exception as exc:
             self.logger.error(
@@ -414,10 +487,20 @@ class TelegramController:
                     "Telegram send failed",
                     extra={"component": "telegram", "error": str(exc)},
                 )
+                item.attempts += 1
+                if item.attempts < 3:
+                    # Exponential backoff
+                    await asyncio.sleep(min(5 * item.attempts, 30))
+                    await self._notification_queue.put(item)
+                else:
+                    self.logger.error(
+                        "Dropping notification after retries",
+                        extra={"component": "telegram", "message": item.message[:200]},
+                    )
             finally:
                 self._notification_queue.task_done()
 
-    async def _send_with_rate_limit(self, item: Dict[str, Any]) -> None:
+    async def _send_with_rate_limit(self, item: _NotificationItem) -> None:
         if self._app is None:
             return
 
@@ -425,8 +508,8 @@ class TelegramController:
         while not self._send_rate_limiter.try_acquire():
             await asyncio.sleep(0.2)
 
-        msg = item.get("message", "")
-        reply_markup = item.get("reply_markup")
+        msg = item.message
+        reply_markup = item.reply_markup
 
         # split long messages
         chunks = self._split_message(msg, limit=3500)
