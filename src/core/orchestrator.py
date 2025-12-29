@@ -7,7 +7,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 import os
 import yaml
@@ -16,12 +16,17 @@ from src.database.operations import create_engine_from_config, init_db, Database
 from src.database.models import Post, PostStatus, Account
 from src.core.scheduler import Scheduler
 from src.platforms.reddit_adapter import RedditAdapter
+from src.platforms.youtube_adapter import YouTubeAdapter
 from src.core.state_manager import StateManager
 from src.telegram.controller import TelegramController
 from src.utils.config_loader import ConfigManager
 from src.utils.logger import setup_logger
 from src.content.templates import TemplateManager
 from src.content.generator import ContentGenerator
+from src.monitoring.health_checker import HealthChecker
+from src.monitoring.analytics import Analytics
+from src.monitoring.alert_manager import AlertManager
+from src.core.account_manager import AccountManager
 
 
 class SystemOrchestrator:
@@ -48,6 +53,12 @@ class SystemOrchestrator:
         self.telegram: Optional[TelegramController] = None
         self.template_manager: Optional[TemplateManager] = None
         self.content_generator: Optional[ContentGenerator] = None
+        self.health_checker: Optional[HealthChecker] = HealthChecker(db=self.db, telegram=None, logger=self.logger.getChild("health"))
+        self.analytics: Optional[Analytics] = Analytics(db=self.db, logger=self.logger.getChild("analytics"))
+        self.alert_manager: Optional[AlertManager] = AlertManager(telegram=None, logger=self.logger.getChild("alert"))
+        self.account_manager: Optional[AccountManager] = AccountManager(db=self.db, logger=self.logger.getChild("accounts"))
+        self.reddit_adapter: Optional[RedditAdapter] = None
+        self.youtube_adapter: Optional[YouTubeAdapter] = None
         self._stop_event = asyncio.Event()
         self._shutdown_event = asyncio.Event()
 
@@ -63,12 +74,18 @@ class SystemOrchestrator:
                 logger=self.logger.getChild("telegram"),
                 log_file_path=self.config_manager.config.logging.file_path,
             )
+            if self.health_checker:
+                self.health_checker.telegram = self.telegram
+            if self.alert_manager:
+                self.alert_manager.telegram = self.telegram
 
             self._load_content_resources()
             self._register_signal_handlers()
 
             self._load_persisted_state()
             self._schedule_recurring_tasks()
+
+            self._init_platform_adapters()
 
             telegram_task = asyncio.create_task(self.telegram.start(), name="telegram")
             scheduler_task = asyncio.create_task(self.scheduler.run(self._stop_event), name="scheduler")
@@ -149,30 +166,24 @@ class SystemOrchestrator:
                     return False
                 
                 platform = post.platform
-                
+
                 # Check if auto-posting is enabled for this platform
-                platform_config = self.config_manager.get(f"platforms.{platform}")
-                if not platform_config or not platform_config.get('auto_post_after_approval', False):
+                platform_config = getattr(self.config_manager.config.platforms, platform, None)
+                if not platform_config or not getattr(platform_config, "auto_post_after_approval", False):
                     self.logger.info(f"Auto-posting disabled for {platform}, skipping")
                     return False
-                
+
                 # Update post status to POSTING
                 post.status = PostStatus.POSTING
                 post.updated_at = datetime.utcnow()
                 session.add(post)
                 session.commit()
-                
+
             # Initialize the appropriate adapter
             adapter = None
-            if platform == 'reddit':
-                from src.platforms.reddit_adapter import RedditAdapter
-                adapter = RedditAdapter(
-                    config=self.config_manager.config,
-                    db_session=self.db.session_factory(),
-                    logger=self.logger.getChild("reddit_adapter")
-                )
-            # Add other platform adapters here
-            
+            adapter_session = None
+            if platform == "reddit":
+                adapter, adapter_session = self._get_reddit_adapter()
             if not adapter:
                 error_msg = f"No adapter found for platform {platform}"
                 self.logger.error(error_msg)
@@ -181,16 +192,17 @@ class SystemOrchestrator:
                     post.status = PostStatus.FAILED
                     post.error_message = error_msg
                     session.add(post)
+                if adapter_session:
+                    adapter_session.close()
                 return False
             
             # Post the content using the adapter
             self.logger.info(f"Posting content to {platform} (post_id={post_id})...")
             
-            # For Reddit, we need to find a target post first
             target_post = None
-            if platform == 'reddit':
-                # Get subreddit from post metadata
-                subreddit = post.metadata_json.get('subreddit') if post.metadata_json else None
+            account = None
+            if platform == "reddit":
+                subreddit = post.metadata_json.get("subreddit") if post.metadata_json else None
                 if not subreddit:
                     error_msg = "No subreddit specified in post metadata"
                     self.logger.error(error_msg)
@@ -200,16 +212,15 @@ class SystemOrchestrator:
                         post.error_message = error_msg
                         session.add(post)
                     return False
-                
-                # Find a suitable target post
+
                 find_result = adapter.find_target_posts(
                     location=subreddit,
-                    limit=5,  # Get top 5 posts to choose from
-                    min_score=10,  # Minimum upvotes
-                    min_comments=3  # Minimum comments
+                    limit=5,
+                    min_score=10,
+                    min_comments=3,
                 )
-                
-                if not find_result.success or not find_result.data.get('items'):
+
+                if not find_result.success or not find_result.data.get("items"):
                     error_msg = f"Failed to find target posts in r/{subreddit}: {find_result.error}"
                     self.logger.error(error_msg)
                     with self.db.session_scope() as session:
@@ -218,16 +229,17 @@ class SystemOrchestrator:
                         post.error_message = error_msg
                         session.add(post)
                     return False
-                
-                # Select the first target post
-                target_post = find_result.data['items'][0]
-                self.logger.info(f"Found target post: {target_post.get('title', 'No title')}")
-            
+
+                target_post = find_result.data["items"][0]
+                if self.account_manager:
+                    acct = self.account_manager.get_best_account("reddit")
+                    account = acct.id if acct else None
+
             # Post the content
             post_result = await adapter.post_comment(
-                target_id=target_post['id'] if target_post else None,
+                target_id=target_post["id"] if target_post else None,
                 content=post.content,
-                account=None  # Let the adapter choose the best account
+                account=account,
             )
             
             # Handle the result
@@ -288,7 +300,8 @@ class SystemOrchestrator:
                         extra={"error": error_msg, "post_id": post_id, "platform": platform}
                     )
                     return False
-                    
+            if adapter_session:
+                adapter_session.close()
         except Exception as e:
             error_msg = f"Unexpected error in _auto_post_approved_content: {str(e)}"
             self.logger.error(error_msg, exc_info=True)
@@ -349,6 +362,13 @@ class SystemOrchestrator:
             },
         )
 
+    def _seconds_until_utc_hour(self, hour: int) -> int:
+        now = datetime.utcnow()
+        target = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+        if target <= now:
+            target = target + timedelta(days=1)
+        return int((target - now).total_seconds())
+
     def _schedule_recurring_tasks(self) -> None:
         # Schedule daily routine (human-in-the-loop, no auto-posting).
         # Runs once every 24h; can be triggered manually by calling execute_daily_routine.
@@ -357,6 +377,31 @@ class SystemOrchestrator:
             interval_seconds=24 * 3600,
             start_in_seconds=30,
             coro_factory=lambda: self.execute_daily_routine(),
+        )
+
+        # Health check every 5 minutes
+        self.scheduler.schedule_every(
+            "health_check",
+            interval_seconds=300,
+            start_in_seconds=15,
+            coro_factory=lambda: self._run_health_check(),
+        )
+
+        # Daily analytics at 09:00 UTC
+        start_in = self._seconds_until_utc_hour(9)
+        self.scheduler.schedule_every(
+            "daily_analytics",
+            interval_seconds=24 * 3600,
+            start_in_seconds=start_in,
+            coro_factory=lambda: self._send_daily_analytics(),
+        )
+
+        # Weekly performance review (every 7 days)
+        self.scheduler.schedule_every(
+            "weekly_review",
+            interval_seconds=7 * 24 * 3600,
+            start_in_seconds=start_in,
+            coro_factory=lambda: self._send_daily_analytics(weekly=True),
         )
 
     def _load_content_resources(self) -> None:
@@ -389,108 +434,274 @@ class SystemOrchestrator:
             synonyms=synonyms,
         )
 
+    def _init_platform_adapters(self) -> None:
+        cfg = self.config_manager.config
+        self.reddit_adapter = None  # instantiate on demand with active DB session
+        self.youtube_adapter = YouTubeAdapter(
+            config=cfg,
+            credentials=[],
+            logger=self.logger.getChild("youtube"),
+            telegram=self.telegram,
+        )
+        # Integrate monitoring helpers with adapters if needed later
+
+    def _get_reddit_adapter(self) -> tuple[Optional[RedditAdapter], Optional[object]]:
+        """Create a RedditAdapter with a dedicated session for posting/health checks."""
+        try:
+            session = self.db._session_factory()  # type: ignore[attr-defined]
+            adapter = RedditAdapter(
+                config=self.config_manager.config,
+                credentials=[],
+                logger=self.logger.getChild("reddit"),
+                telegram=self.telegram,
+                db_session=session,
+            )
+            return adapter, session
+        except Exception as exc:
+            self.logger.error(
+                "Failed to initialize Reddit adapter",
+                extra={"component": "orchestrator", "error": str(exc)},
+            )
+            return None, None
+
     async def execute_daily_routine(self) -> None:
         """Generate drafts for configured platforms (no auto-post)."""
         if self.content_generator is None:
             self.logger.error("Content generator not initialized", extra={"component": "orchestrator"})
             return
         reddit_cfg = self.config_manager.config.platforms.reddit
-        if not reddit_cfg.enabled:
-            return
+        youtube_cfg = self.config_manager.config.platforms.youtube
+        drafted = []
+        try:
+            if reddit_cfg.enabled:
+                drafted.extend(await self._generate_reddit_drafts(reddit_cfg))
+            if youtube_cfg.enabled:
+                drafted.extend(await self._generate_youtube_pipeline(youtube_cfg))
+
+            if self.telegram and drafted:
+                lines = ["Daily routine drafts:"]
+                for item in drafted:
+                    lines.append(f"- {item['platform']}: score={item['score']:.2f}, post_id={item['post_id']}")
+                await self.telegram.send_notification("\n".join(lines), priority="INFO")
+        except Exception as exc:
+            self.logger.error("Daily routine failed", extra={"component": "orchestrator", "error": str(exc)})
+
+    async def _generate_reddit_drafts(self, reddit_cfg) -> List[Dict[str, Any]]:
         drafted = []
         max_per_day = reddit_cfg.max_posts_per_day
         threshold = reddit_cfg.quality_threshold
-        try:
-            for idx, subreddit in enumerate(reddit_cfg.subreddits):
-                if idx >= max_per_day:
-                    break
-                res = self.content_generator.generate_reddit_comment(subreddit=subreddit)
-                quality = res.get("quality", {})
-                score = quality.get("score", 0.0)
-                template_id = res.get("template_id")
+        for idx, subreddit in enumerate(reddit_cfg.subreddits):
+            if idx >= max_per_day:
+                break
+            res = self.content_generator.generate_reddit_comment(subreddit=subreddit)
+            drafted.append(await self._persist_and_review(post_data=res, platform="reddit", meta={"subreddit": subreddit}, threshold=threshold))
+        return [d for d in drafted if d]
 
+    async def _generate_youtube_pipeline(self, youtube_cfg) -> List[Dict[str, Any]]:
+        drafted = []
+        keywords = youtube_cfg.search_keywords or []
+        if not keywords or not self.youtube_adapter:
+            return drafted
+        search = self.youtube_adapter.search_videos_by_keywords(keywords=keywords, limit=10)
+        if not search.success:
+            self.logger.warning("YouTube search failed", extra={"error": search.error})
+            return drafted
+        videos = search.data.get("items", [])[: youtube_cfg.max_comments_per_day]
+        for video in videos:
+            res = self.content_generator.generate_youtube_comment(video_title=video.get("title",""), video_description=video.get("description",""))
+            drafted.append(await self._persist_and_review(
+                post_data=res,
+                platform="youtube",
+                meta={"video_id": video.get("id"), "video_url": video.get("url")},
+                threshold=youtube_cfg.get("quality_threshold", 0.7),
+            ))
+        return [d for d in drafted if d]
+
+    async def _persist_and_review(self, post_data: Dict[str, Any], platform: str, meta: Dict[str, Any], threshold: float) -> Optional[Dict[str, Any]]:
+        quality = post_data.get("quality", {})
+        score = quality.get("score", 0.0)
+        template_id = post_data.get("template_id")
+        with self.db.session_scope(logger=self.logger) as session:
+            post = Post(
+                account_id=None,
+                platform=platform,
+                content=post_data.get("content", ""),
+                url=None,
+                posted_at=None,
+                status=PostStatus.pending,
+                clicks=0,
+                conversions=0,
+                quality_score=score,
+                human_approved=False,
+                metadata_json={
+                    "template_id": template_id,
+                    "quality": quality,
+                    "errors": post_data.get("errors"),
+                    "warnings": post_data.get("warnings"),
+                    **meta,
+                },
+            )
+            session.add(post)
+            session.flush()
+            post_id = post.id
+
+        if self.telegram and score < threshold:
+            context = {
+                "platform": platform,
+                "score": score,
+                "content": post_data.get("content", ""),
+                "template_id": template_id,
+                "suggestions": quality.get("suggestions"),
+                **meta,
+            }
+            review = await self.telegram.request_human_input(
+                action_type="CONTENT_REVIEW",
+                context=context,
+                timeout=self.config_manager.config.telegram.timeout_seconds,
+            )
+            if review.response_value:
+                new_content = review.response_value
                 with self.db.session_scope(logger=self.logger) as session:
-                    post = Post(
-                        account_id=None,
-                        platform="reddit",
-                        content=res.get("content", ""),
-                        url=None,
-                        posted_at=None,
-                        status=PostStatus.pending,
-                        clicks=0,
-                        conversions=0,
-                        quality_score=score,
-                        human_approved=False,
-                        metadata_json={
-                            "template_id": template_id,
-                            "quality": quality,
-                            "errors": res.get("errors"),
-                            "warnings": res.get("warnings"),
-                            "subreddit": subreddit,
-                        },
+                    session.query(Post).filter(Post.id == post_id).update(
+                        {"content": new_content, "human_approved": True, "status": PostStatus.APPROVED}
                     )
-                    session.add(post)
-                    session.flush()
-                    drafted.append({"subreddit": subreddit, "score": score, "post_id": post.id})
+            elif not review.timeout:
+                with self.db.session_scope(logger=self.logger) as session:
+                    session.query(Post).filter(Post.id == post_id).update(
+                        {"human_approved": True, "status": PostStatus.APPROVED}
+                    )
+        return {"platform": platform, "score": score, "post_id": post_id}
 
-                # Human review if below threshold
-                if self.telegram and score < threshold:
-                    context = {
-                        "subreddit": subreddit,
-                        "score": score,
-                        "content": res.get("content", ""),
-                        "template_id": template_id,
-                        "suggestions": quality.get("suggestions"),
-                    }
-                    review = await self.telegram.request_human_input(
-                        action_type="CONTENT_REVIEW",
-                        context=context,
-                        timeout=self.config_manager.config.telegram.timeout_seconds,
+    async def _run_health_check(self) -> None:
+        if not self.health_checker:
+            return
+        try:
+            results = await self.health_checker.check_all()
+            overall = results.get("overall")
+            if overall:
+                self.logger.info(
+                    "Health check completed",
+                    extra={"component": "health", "overall_score": overall.score, "status": overall.status},
+                )
+                if overall.status != "healthy" and self.telegram:
+                    msg = (
+                        f"⚕️ Health check: {overall.status.upper()} (score={overall.score:.2f})\n"
+                        + "\n".join([f"- {k}: {v.status} ({v.score:.2f})" for k, v in results.items() if k != "overall"])
                     )
-                    decision = "timeout" if review.timeout else "approved"
-                    post_id = drafted[-1]["post_id"]
-                    if review.response_value:
-                        # If edited content returned
-                        new_content = review.response_value
-                        with self.db.session_scope(logger=self.logger) as session:
-                            session.query(Post).filter(Post.id == post_id).update(
-                                {
-                                    "content": new_content, 
-                                    "human_approved": True,
-                                    "status": PostStatus.APPROVED
-                                }
-                            )
-                    elif not review.timeout:
-                        with self.db.session_scope(logger=self.logger) as session:
-                            session.query(Post).filter(Post.id == post_id).update(
-                                {
-                                    "human_approved": True,
-                                    "status": PostStatus.APPROVED
-                                }
-                            )
-                    
-                    # Handle auto-posting if enabled
-                    if not review.timeout and reddit_cfg.auto_post_after_approval:
-                        # Use create_task to run in background
-                        asyncio.create_task(self._auto_post_approved_content(post_id))
-                        self.logger.info(
-                            f"Auto-posting started for post_id={post_id}",
-                            extra={"post_id": post_id, "subreddit": subreddit}
-                        )
-                    
-                    self.logger.info(
-                        f"Content review completed, auto-post: {reddit_cfg.auto_post_after_approval}",
-                        extra={"component": "orchestrator", "subreddit": subreddit, "decision": decision},
-                    )
-
-            # Notify summary
-            if self.telegram and drafted:
-                lines = ["Daily routine drafts (no auto-post):"]
-                for item in drafted:
-                    lines.append(f"- r/{item['subreddit']}: score={item['score']:.2f}, post_id={item['post_id']}")
-                await self.telegram.send_notification("\n".join(lines), priority="INFO")
+                    await self.telegram.send_notification(msg, priority="WARNING")
+            if self.alert_manager:
+                await self.alert_manager.process_health_results(results)
         except Exception as exc:
             self.logger.error(
-                "Daily routine failed",
-                extra={"component": "orchestrator", "error": str(exc)},
+                "Health check failed",
+                extra={"component": "health", "error": str(exc)},
             )
+
+    async def _send_daily_analytics(self, weekly: bool = False) -> None:
+        if not self.analytics or not self.telegram:
+            return
+        try:
+            now = datetime.utcnow()
+            if weekly:
+                start = now - timedelta(days=7)
+                title = "📈 Weekly Performance Review"
+            else:
+                start = now - timedelta(days=1)
+                title = "📊 Daily Analytics"
+            metrics = self.analytics.get_metrics(start, now)
+
+            report = self._format_daily_report(title, start, now, metrics)
+
+            await self.telegram.send_notification(report["text"], priority="INFO", reply_markup=report["buttons"])
+        except Exception as exc:
+            self.logger.error(
+                "Daily analytics failed",
+                extra={"component": "analytics", "error": str(exc)},
+            )
+
+    def _format_daily_report(self, title: str, start: datetime, end: datetime, metrics: Any) -> Dict[str, Any]:
+        """Create rich ASCII report with tables and recommendations."""
+        total_posts = max(1, metrics.total_posts)
+
+        # Platform breakdown bar chart
+        breakdown_lines = []
+        for platform, count in metrics.posts_by_platform.items():
+            pct = (count / total_posts) * 100
+            bars = "█" * max(1, int(pct / 5))
+            breakdown_lines.append(f"{platform.ljust(8)} | {bars.ljust(20)} {pct:5.1f}% ({count})")
+
+        # Performance table
+        perf_table = [
+            "┌──────────────────────────────┐",
+            f"│ Posts        : {metrics.total_posts:5d}           │",
+            f"│ Clicks       : {metrics.total_clicks:5d}           │",
+            f"│ Conversions  : {metrics.total_conversions:5d}      │",
+            f"│ Conv. Rate   : {metrics.conversion_rate:6.2%}       │",
+            f"│ Avg Quality  : {metrics.avg_quality_score:6.2f}      │",
+            "└──────────────────────────────┘",
+        ]
+
+        # Top posts list
+        top_lines = []
+        for p in metrics.top_performing_posts:
+            trend = "↑" if p.get("conversions", 0) > 0 else "→"
+            top_lines.append(
+                f"{trend} {p['platform']} id={p['id']} clicks={p['clicks']} conv={p['conversions']} q={p.get('quality_score')}"
+            )
+
+        # Account performance
+        account_lines = []
+        for platform, data in (metrics.account_performance or {}).items():
+            status_icon = "✅" if data.get("avg_health_score", 0) >= 0.7 else ("⚠️" if data.get("avg_health_score",0) >= 0.4 else "❌")
+            account_lines.append(
+                f"{status_icon} {platform}: active={data.get('active_accounts',0)}, health={data.get('avg_health_score',0):.2f}"
+            )
+
+        # Recommendations
+        recs = []
+        if metrics.conversion_rate < 0.01:
+            recs.append("🎯 Improve targeting or adjust referral placement.")
+        if metrics.avg_quality_score < 0.7:
+            recs.append("📝 Tweak templates/synonyms; raise quality threshold.")
+        low_health = [p for p, d in (metrics.account_performance or {}).items() if d.get("avg_health_score",0) < 0.5]
+        if low_health:
+            recs.append(f"🔁 Rotate or rest accounts: {', '.join(low_health)}.")
+        if not recs:
+            recs.append("✅ Keep current strategy; metrics trending stable.")
+
+        text = "\n".join(
+            [
+                f"{title} ({start.date()} → {end.date()})",
+                *perf_table,
+                "Platform breakdown:",
+                *breakdown_lines,
+                "",
+                "Top posts:",
+                *(top_lines or ["- none"]),
+                "",
+                "Accounts:",
+                *(account_lines or ["- none"]),
+                "",
+                "Recommendations:",
+                *recs,
+            ]
+        )
+
+        # Interactive buttons
+        try:
+            from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+            buttons = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton("View Detailed Stats", callback_data="logs"),
+                        InlineKeyboardButton("Run Health Check", callback_data="status"),
+                    ],
+                    [
+                        InlineKeyboardButton("Review Flagged Accounts", callback_data="accounts"),
+                    ],
+                ]
+            )
+        except Exception:
+            buttons = None
+
+        return {"text": text, "buttons": buttons}

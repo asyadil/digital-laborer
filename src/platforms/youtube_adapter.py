@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
@@ -28,6 +29,7 @@ from src.platforms.base_adapter import (
 )
 from src.utils.rate_limiter import FixedWindowRateLimiter
 from src.utils.retry import retry_with_exponential_backoff
+from src.platforms.captcha_handler import CaptchaHandler
 
 
 class YouTubeAdapter(BasePlatformAdapter):
@@ -39,6 +41,7 @@ class YouTubeAdapter(BasePlatformAdapter):
         self._client = None
         self._logged_in_as = None
         self._service = None
+        self.captcha_handler = CaptchaHandler(telegram) if telegram else None
 
     def _create_client(self, account: Dict[str, Any]) -> Any:
         """Create and return an authenticated YouTube client."""
@@ -50,8 +53,9 @@ class YouTubeAdapter(BasePlatformAdapter):
                 client_id=account.get('client_id'),
                 client_secret=account.get('client_secret')
             )
-            
-            # Build the YouTube API client
+            # Force refresh if token expired
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
             youtube = build('youtube', 'v3', credentials=creds)
             return youtube
         except Exception as exc:
@@ -88,7 +92,6 @@ class YouTubeAdapter(BasePlatformAdapter):
         """Authenticate with YouTube using OAuth 2.0 credentials."""
         try:
             self._service = self._create_client(account)
-            # Test the connection by getting channel info
             channels = self._call_with_limits(
                 self._service.channels().list,
                 part='snippet',
@@ -113,6 +116,27 @@ class YouTubeAdapter(BasePlatformAdapter):
                 retry_recommended=isinstance(exc, RateLimitError)
             )
         except Exception as exc:
+            # Try 2FA rescue if available
+            if self.captcha_handler:
+                try:
+                    code = self.captcha_handler.handle_2fa_sync(platform="youtube", method="app", timeout=300)
+                    if code.solved and code.response:
+                        account = {**account, "otp": code.response}
+                        self._service = self._create_client(account)
+                        channels = self._call_with_limits(
+                            self._service.channels().list,
+                            part='snippet',
+                            mine=True,
+                            maxResults=1
+                        )
+                        if channels.get('items'):
+                            self._logged_in_as = channels['items'][0]['snippet']['title']
+                            return AdapterResult(
+                                success=True,
+                                data={"username": self._logged_in_as, "channel_id": channels['items'][0]['id']}
+                            )
+                except Exception:
+                    pass
             self.logger.error(
                 "YouTube login failed", 
                 extra={"component": "youtube_adapter", "error": str(exc)}
@@ -307,6 +331,74 @@ class YouTubeAdapter(BasePlatformAdapter):
                 extra={"component": "youtube_adapter", "error": str(exc)}
             )
             return AdapterResult(success=False, data={}, error=str(exc), retry_recommended=True)
+
+    def _calculate_relevance(self, item: Dict[str, Any], keyword: str) -> float:
+        """Calculate a relevance score based on title/description match."""
+        title = item.get("title", "").lower()
+        desc = item.get("description", "").lower()
+        kw = keyword.lower()
+        score = 0.0
+        if kw in title:
+            score += 0.5
+        if kw in desc:
+            score += 0.3
+        if title.startswith(kw):
+            score += 0.2
+        return min(1.0, score)
+
+    def search_videos_by_keywords(self, keywords: List[str], limit: int = 20, published_after: Optional[str] = None) -> AdapterResult:
+        """Search YouTube videos by keywords using the search endpoint."""
+        try:
+            if not self._service:
+                raise AuthenticationError("Not authenticated with YouTube")
+            items: List[Dict[str, Any]] = []
+            seen_ids: set[str] = set()
+            for keyword in keywords:
+                search_response = self._call_with_limits(
+                    self._service.search().list,
+                    part="snippet",
+                    q=keyword,
+                    type="video",
+                    maxResults=min(limit, 50),
+                    order="relevance",
+                    publishedAfter=published_after,
+                    relevanceLanguage="en",
+                    videoCaption="any",
+                )
+                for item in search_response.get("items", []):
+                    vid = item["id"]["videoId"]
+                    if vid in seen_ids:
+                        continue
+                    seen_ids.add(vid)
+                    snippet = item.get("snippet", {})
+                    video = {
+                        "id": vid,
+                        "title": snippet.get("title", ""),
+                        "description": snippet.get("description", ""),
+                        "url": f"https://www.youtube.com/watch?v={vid}",
+                        "published_at": snippet.get("publishedAt"),
+                        "channel_id": snippet.get("channelId"),
+                        "channel_title": snippet.get("channelTitle"),
+                        "relevance": self._calculate_relevance({"title": snippet.get("title",""), "description": snippet.get("description","")}, keyword),
+                    }
+                    items.append(video)
+            # sort by relevance desc
+            items.sort(key=lambda x: x.get("relevance", 0), reverse=True)
+            return AdapterResult(
+                success=True,
+                data={"items": items[:limit], "count": len(items[:limit])},
+            )
+        except Exception as exc:
+            self.logger.error(
+                "YouTube search failed",
+                extra={"component": "youtube_adapter", "error": str(exc)},
+            )
+            return AdapterResult(
+                success=False,
+                data={"items": []},
+                error=str(exc),
+                retry_recommended=True,
+            )
 
     def close(self) -> None:
         return

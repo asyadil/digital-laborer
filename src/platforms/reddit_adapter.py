@@ -5,6 +5,8 @@ to be fault-tolerant and testable with mocks (no real network in tests).
 """
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 import re
 import time
@@ -21,6 +23,7 @@ from src.platforms.base_adapter import (
     PlatformAdapterError,
     RateLimitError,
 )
+from src.platforms.captcha_handler import CaptchaHandler
 from src.utils.crypto import credential_manager
 from src.utils.rate_limiter import FixedWindowRateLimiter
 from src.utils.retry import retry_with_exponential_backoff
@@ -37,6 +40,7 @@ class RedditAdapter(BasePlatformAdapter):
         self._logged_in_as: Optional[str] = None
         self._current_account_id: Optional[int] = None
         self._last_health_check: Dict[int, float] = {}  # account_id -> timestamp
+        self.captcha_handler = CaptchaHandler(telegram) if telegram else None
 
     def _load_account_from_db(self, account_id: int) -> Optional[Dict[str, Any]]:
         """Load and decrypt account credentials from database."""
@@ -61,29 +65,41 @@ class RedditAdapter(BasePlatformAdapter):
         }
 
     def _get_best_account(self) -> Optional[Dict[str, Any]]:
-        """Get the best available account based on health score and last used time."""
+        """Get the healthiest, least-recently-used active account."""
         if not self.db_session:
             self.logger.error("Database session not provided")
             return None
-            
-        # Find the healthiest, least recently used active account
-        account = (self.db_session.query(Account)
-                  .filter(
-                      Account.platform == 'reddit',
-                      Account.status == AccountStatus.active,
-                      Account.health_score > 0.5  # Only use accounts with good health
-                  )
-                  .order_by(
-                      Account.health_score.desc(),
-                      Account.last_used.asc()  # Prefer least recently used
-                  )
-                  .first())
-                  
-        if not account:
-            self.logger.error("No healthy Reddit accounts available")
+
+        now = datetime.utcnow()
+        cooldown = timedelta(minutes=1)
+        accounts = (
+            self.db_session.query(Account)
+            .filter(Account.platform == "reddit", Account.status == AccountStatus.active)
+            .order_by(Account.health_score.desc(), Account.last_used.asc().nullsfirst())
+            .all()
+        )
+        if not accounts:
             return None
-            
-        return self._load_account_from_db(account.id)
+
+        for account in accounts:
+            last_used = account.last_used or datetime.min.replace(tzinfo=None)
+            if (now - last_used) > cooldown:
+                return {
+                    "id": account.id,
+                    "username": account.username,
+                    "password": credential_manager.decrypt(account.password_encrypted),
+                    "health_score": account.health_score,
+                    "metadata": account.metadata_json or {},
+                }
+
+        account = accounts[0]
+        return {
+            "id": account.id,
+            "username": account.username,
+            "password": credential_manager.decrypt(account.password_encrypted),
+            "health_score": account.health_score,
+            "metadata": account.metadata_json or {},
+        }
 
     def _update_account_health(self, account_id: int, success: bool, error: str = None):
         """Update account health based on operation result."""
@@ -164,8 +180,20 @@ class RedditAdapter(BasePlatformAdapter):
             self._current_account_id = account.get('id')
             
             # Create and test client
-            self._client = self._create_client(account)
-            me = self._call_with_limits(lambda: self._client.user.me())
+            try:
+                self._client = self._create_client(account)
+                me = self._call_with_limits(lambda: self._client.user.me())
+            except AuthenticationError as auth_exc:
+                if "2fa" in str(auth_exc).lower() or "otp" in str(auth_exc).lower():
+                    if not self.captcha_handler:
+                        raise
+                    code_result = self.captcha_handler.handle_2fa_sync(platform="reddit", method="app", timeout=300)
+                    if not code_result.solved or not code_result.response:
+                        raise
+                    self._client = self._create_client(account, otp=code_result.response)
+                    me = self._call_with_limits(lambda: self._client.user.me())
+                else:
+                    raise
             
             if me is None:
                 error = "Reddit auth failed: user.me returned None"
@@ -462,9 +490,130 @@ class RedditAdapter(BasePlatformAdapter):
                 }
 
             data = self._call_with_limits(_op)
+            shadow = self.check_shadowban(account)
+            data["shadowban"] = shadow
+            if shadow.get("shadowbanned") and shadow.get("confidence", 0) > 0.8:
+                data["issues"].append("shadowban_detected")
+                data["health_score"] = min(data["health_score"], 0.3)
+                if self.db_session and account.get("id"):
+                    db_acc = self.db_session.query(Account).filter(Account.id == account.get("id")).first()
+                    if db_acc:
+                        db_acc.status = AccountStatus.flagged
+                        db_acc.health_score = min(db_acc.health_score or 1.0, shadow.get("confidence", 0.3))
+                        self.db_session.add(db_acc)
+                        self.db_session.commit()
+                if self.telegram:
+                    try:
+                        asyncio.create_task(
+                            self.telegram.send_notification(
+                                f"⚠️ Reddit shadowban detected for {account.get('username','?')} (confidence {shadow.get('confidence'):.2f})",
+                                priority="ERROR",
+                            )
+                        )
+                    except Exception:
+                        pass
             return AdapterResult(success=True, data=data)
         except Exception as exc:
             return AdapterResult(success=False, data={}, error=str(exc), retry_recommended=True)
+
+    def check_shadowban(self, account: Dict[str, Any]) -> Dict[str, Any]:
+        """Detect potential shadowban using multiple heuristics."""
+        results: Dict[str, Any] = {"shadowbanned": False, "confidence": 0.0, "reasons": [], "methods_used": {}}
+        confidences: List[float] = []
+
+        # Method A: r/ShadowBan test post
+        try:
+            sub = self._client.subreddit("ShadowBan")
+            submission = sub.submit(
+                title="Am I shadowbanned?",
+                selftext="Automated shadowban check.",
+                send_replies=False,
+            )
+            time.sleep(5)
+            submission.refresh()
+            comments = list(getattr(submission, "comments", []) or [])
+            response_text = " ".join([getattr(c, "body", "").lower() for c in comments])
+            method_conf = 0.0
+            if "shadowbanned" in response_text:
+                method_conf = 0.95
+                results["reasons"].append("AutoModerator indicates shadowban")
+            elif "not shadowbanned" in response_text:
+                method_conf = 0.05
+            if method_conf:
+                confidences.append(method_conf)
+            results["methods_used"]["shadowban_post"] = {"confidence": method_conf}
+            # Clean up
+            try:
+                submission.delete()
+            except Exception:
+                pass
+        except Exception as exc:
+            self.logger.warning("Shadowban test post failed", extra={"error": str(exc)})
+            results["methods_used"]["shadowban_post"] = {"error": str(exc), "confidence": 0.0}
+
+        # Method B: last 5 comments visibility
+        try:
+            user = self._client.user.me()
+            comments = list(user.comments.new(limit=5))
+            visible = 0
+            total = 0
+            for c in comments:
+                total += 1
+                try:
+                    parent = c.submission
+                    parent.comments.replace_more(limit=0)
+                    found = any(getattr(child, "id", "") == getattr(c, "id", "") for child in parent.comments.list())
+                    if found:
+                        visible += 1
+                except Exception:
+                    continue
+            visibility_rate = (visible / total) if total else 1.0
+            conf_b = 1.0 - visibility_rate
+            confidences.append(conf_b)
+            results["methods_used"]["comment_visibility"] = {
+                "visible": visible,
+                "total": total,
+                "visibility_rate": visibility_rate,
+                "confidence": conf_b,
+            }
+            if conf_b > 0.5:
+                results["reasons"].append("Low visibility for recent comments")
+        except Exception as exc:
+            self.logger.warning("Shadowban comment visibility check failed", extra={"error": str(exc)})
+            results["methods_used"]["comment_visibility"] = {"error": str(exc), "confidence": 0.0}
+
+        # Method C: post history engagement
+        try:
+            user = self._client.user.me()
+            subs = list(user.submissions.new(limit=20))
+            scores = [int(getattr(s, "score", 0)) for s in subs]
+            low_engagement = sum(1 for s in scores if s <= 1)
+            ratio = (low_engagement / len(scores)) if scores else 0.0
+            avg_score = sum(scores) / len(scores) if scores else 0.0
+            conf_c = 0.0
+            if ratio > 0.7:
+                conf_c = 0.6
+                results["reasons"].append("Most posts have ≤1 score")
+            if avg_score < 1 and len(scores) >= 5:
+                conf_c = max(conf_c, 0.5)
+            confidences.append(conf_c)
+            results["methods_used"]["history_analysis"] = {
+                "average_score": avg_score,
+                "low_score_ratio": ratio,
+                "confidence": conf_c,
+            }
+        except Exception as exc:
+            self.logger.warning("Shadowban history analysis failed", extra={"error": str(exc)})
+            results["methods_used"]["history_analysis"] = {"error": str(exc), "confidence": 0.0}
+
+        # Aggregate confidence
+        if confidences:
+            agg = sum(confidences) / len(confidences)
+        else:
+            agg = 0.0
+        results["confidence"] = round(agg, 3)
+        results["shadowbanned"] = agg >= 0.5
+        return results
 
     def close(self) -> None:
         self._client = None
@@ -486,7 +635,7 @@ class RedditAdapter(BasePlatformAdapter):
         # Alternate: comment id in query or fragment is not handled.
         return None
 
-    def _create_client(self, account: Dict[str, Any]) -> Any:
+    def _create_client(self, account: Dict[str, Any], otp: Optional[str] = None) -> Any:
         try:
             import praw  # type: ignore
         except Exception as exc:
@@ -504,6 +653,9 @@ class RedditAdapter(BasePlatformAdapter):
         password = oauth_cfg.get("password")
         if not all([client_id, client_secret, user_agent, username, password]):
             raise AuthenticationError("Missing Reddit OAuth credentials")
+
+        if otp:
+            password = f"{password}:{otp}"
 
         return praw.Reddit(
             client_id=client_id,

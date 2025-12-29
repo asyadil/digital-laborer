@@ -258,6 +258,99 @@ class TelegramController:
             timeout=timed_out,
         )
 
+    async def request_custom_input(
+        self,
+        action_type: str,
+        context: Dict[str, Any],
+        message: str,
+        reply_markup: Optional[InlineKeyboardMarkup] = None,
+        timeout: int = 3600,
+        action_id: Optional[str] = None,
+    ) -> HumanInputResult:
+        """Generic variant of request_human_input allowing custom message and keyboard."""
+        action_id = action_id or uuid.uuid4().hex
+        requested_at = datetime.utcnow()
+
+        persisted_context = dict(context or {})
+        persisted_context["action_id"] = action_id
+
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._pending_futures[action_id] = future
+
+        try:
+            with self.db.session_scope(logger=self.logger) as session:
+                session.add(
+                    TelegramInteraction(
+                        action_type=action_type,
+                        context=persisted_context,
+                        requested_at=requested_at,
+                        responded_at=None,
+                        response_value=None,
+                        timeout=False,
+                    )
+                )
+        except Exception as exc:
+            self.logger.error(
+                "Failed to persist telegram interaction",
+                extra={"component": "telegram", "action_id": action_id, "error": str(exc)},
+            )
+
+        await self.send_notification(
+            message,
+            priority="INFO",
+            reply_markup=reply_markup,
+        )
+
+        timed_out = False
+        response_value: Optional[str] = None
+        responded_at: Optional[datetime] = None
+        try:
+            result: Dict[str, Any] = await asyncio.wait_for(future, timeout=timeout)
+            response_value = result.get("response_value") if isinstance(result, dict) else None
+            responded_at = datetime.utcnow()
+        except asyncio.TimeoutError:
+            timed_out = True
+        finally:
+            self._pending_futures.pop(action_id, None)
+
+        try:
+            with self.db.session_scope(logger=self.logger) as session:
+                row = (
+                    session.query(TelegramInteraction)
+                    .filter(TelegramInteraction.action_type == action_type)
+                    .filter(TelegramInteraction.requested_at == requested_at)
+                    .first()
+                )
+                if row is None:
+                    row = (
+                        session.query(TelegramInteraction)
+                        .filter(TelegramInteraction.action_type == action_type)
+                        .order_by(TelegramInteraction.requested_at.desc())
+                        .first()
+                    )
+                if row is not None:
+                    row.responded_at = responded_at
+                    row.response_value = response_value
+                    row.timeout = timed_out
+        except Exception as exc:
+            self.logger.error(
+                "Failed to update telegram interaction",
+                extra={"component": "telegram", "action_id": action_id, "error": str(exc)},
+            )
+
+        response_time = None
+        if responded_at is not None:
+            response_time = (responded_at - requested_at).total_seconds()
+
+        return HumanInputResult(
+            action_id=action_id,
+            action_type=action_type,
+            response_value=response_value,
+            responded_at=responded_at,
+            response_time_seconds=response_time,
+            timeout=timed_out,
+        )
+
     async def resolve_action(self, action_id: str, response_type: str, response_value: Optional[str], source: str) -> None:
         """Resolve a pending action (from command/callback)."""
         fut = self._pending_futures.get(action_id)
@@ -286,6 +379,23 @@ class TelegramController:
                 "Failed to enqueue telegram notification",
                 extra={"component": "telegram", "error": str(exc)},
             )
+
+    async def send_file(
+        self,
+        chat_id: Optional[str],
+        file_path: str,
+        caption: Optional[str] = None,
+        reply_markup: Optional[InlineKeyboardMarkup] = None,
+    ) -> None:
+        """Send a file immediately with retry and rate limiting."""
+        target_chat = chat_id or self.user_chat_id
+        await self._send_file(
+            chat_id=str(target_chat),
+            file_path=file_path,
+            caption=caption,
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=reply_markup,
+        )
 
     async def _queue_worker(self) -> None:
         while True:
@@ -345,24 +455,47 @@ class TelegramController:
             )
             raise
 
-    async def _send_file(self, chat_id: int, file_path: str, caption: Optional[str] = None) -> None:
+    async def _send_file(
+        self,
+        chat_id: int,
+        file_path: str,
+        caption: Optional[str] = None,
+        parse_mode: Optional[str] = None,
+        reply_markup: Optional[InlineKeyboardMarkup] = None,
+        max_retries: int = 3,
+    ) -> None:
         if self._app is None:
             return
-        try:
-            with open(file_path, "rb") as f:
-                await self._app.bot.send_document(chat_id=chat_id, document=f, caption=caption)
-        except OSError as exc:
+        if not os.path.exists(file_path):
             self.logger.error(
                 "Failed to read file for Telegram send",
-                extra={"component": "telegram", "error": str(exc), "path": file_path},
+                extra={"component": "telegram", "error": "file not found", "path": file_path},
             )
-            raise
-        except TelegramError as exc:
-            self.logger.error(
-                "Telegram send_document error",
-                extra={"component": "telegram", "error": str(exc)},
-            )
-            raise
+            return
+
+        # Rate limit to avoid Telegram spam.
+        while not self._send_rate_limiter.try_acquire():
+            await asyncio.sleep(0.2)
+
+        for attempt in range(max_retries):
+            try:
+                with open(file_path, "rb") as f:
+                    await self._app.bot.send_document(
+                        chat_id=chat_id,
+                        document=f,
+                        caption=caption,
+                        parse_mode=parse_mode,
+                        reply_markup=reply_markup,
+                    )
+                return
+            except Exception as exc:
+                if attempt == max_retries - 1:
+                    self.logger.error(
+                        "Telegram send_document error",
+                        extra={"component": "telegram", "error": str(exc), "path": file_path},
+                    )
+                    return
+                await asyncio.sleep(2 ** attempt)
 
     async def _on_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle callback queries from inline keyboards."""
@@ -432,7 +565,21 @@ class TelegramController:
             elif query.data.startswith("confirm_delete:"):
                 account_id = query.data.split(":")[1]
                 await self._confirm_delete_account(update, account_id)
-                
+            
+            # Generic action resolution for human-in-the-loop prompts
+            elif query.data.startswith("action:"):
+                parts = query.data.split(":")
+                if len(parts) >= 3:
+                    _, action_id, response_value = parts[0], parts[1], ":".join(parts[2:])
+                    await self.resolve_action(
+                        action_id=action_id,
+                        response_type="callback",
+                        response_value=response_value,
+                        source="callback",
+                    )
+                else:
+                    await self._safe_notify_error("callback_action_parse", ValueError("Invalid action callback format"))
+
         except Exception as exc:
             await self._safe_notify_error("callback_query", exc)
             
@@ -521,6 +668,16 @@ class TelegramController:
             chat_id = str(update.effective_chat.id) if update.effective_chat else ""
             if chat_id != self.user_chat_id:
                 return
+            # If there are pending actions, treat incoming text as a response to the most recent one.
+            if self._pending_futures:
+                # Pick the most recently created future (last inserted key)
+                action_id = next(reversed(self._pending_futures.keys()))
+                await self.resolve_action(
+                    action_id=action_id,
+                    response_type="text",
+                    response_value=update.message.text if update.message else None,
+                    source="text_message",
+                )
         except Exception:
             return
 

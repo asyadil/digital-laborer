@@ -36,6 +36,7 @@ from src.platforms.base_adapter import (
 )
 from src.platforms.selenium_session import SeleniumSession
 from src.utils.rate_limiter import FixedWindowRateLimiter
+from src.platforms.captcha_handler import CaptchaHandler
 from src.utils.retry import retry_with_exponential_backoff
 
 
@@ -52,6 +53,7 @@ class QuoraAdapter(BasePlatformAdapter):
         self._browser_type = config.get('browser', 'chrome')
         self._headless = config.get('headless', True)
         self._timeout = config.get('timeout_seconds', 30)
+        self.captcha_handler = CaptchaHandler(telegram_controller=telegram) if telegram else None
 
     def _init_session(self) -> None:
         """Initialize Selenium session if not already done."""
@@ -89,21 +91,21 @@ class QuoraAdapter(BasePlatformAdapter):
         except (NoSuchElementException, TimeoutException):
             return False
     
-    def _handle_captcha(self) -> None:
-        """Handle CAPTCHA challenges if they appear."""
-        try:
-            # Check for CAPTCHA iframe
-            captcha_frame = self._wait_for_element(
-                By.CSS_SELECTOR, 
-                'iframe[src*="recaptcha"]',
-                timeout=5
-            )
-            if captcha_frame:
-                raise AntiBotChallengeError(
-                    "CAPTCHA detected. Please solve it manually and retry."
-                )
-        except (NoSuchElementException, TimeoutException):
-            pass
+    def _handle_captcha(self, driver: Optional[WebDriver] = None, challenge_type: str = "recaptcha") -> None:
+        """Handle CAPTCHA challenges by delegating to CaptchaHandler."""
+        if not self.captcha_handler:
+            raise AntiBotChallengeError("CAPTCHA detected. Configure Telegram to solve.")
+        driver = driver or (self._session.driver if self._session else None)
+        if not driver:
+            raise AntiBotChallengeError("CAPTCHA detected but no driver available.")
+        result = self.captcha_handler.handle_captcha_sync(
+            driver=driver,
+            challenge_type=challenge_type,
+            context={"platform": "quora"},
+            timeout=self._timeout,
+        )
+        if not result.solved or result.timeout:
+            raise AntiBotChallengeError("CAPTCHA not solved in time.")
     
     def _login_with_credentials(self, email: str, password: str) -> bool:
         """Perform the login process with email and password."""
@@ -142,7 +144,7 @@ class QuoraAdapter(BasePlatformAdapter):
             
             # Check for login success
             if not self._is_logged_in():
-                self._handle_captcha()
+                self._handle_captcha(driver=self._session.driver, challenge_type="recaptcha")
                 return False
                 
             return True
