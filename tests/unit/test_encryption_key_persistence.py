@@ -6,6 +6,7 @@ from src.utils.crypto import _resolve_key, ENV_FILE_PATH, KEY_FILE_PATH
 
 def test_generate_and_persist_key(tmp_path, monkeypatch):
     # point paths to temp dir
+    monkeypatch.delenv("ENCRYPTION_KEY", raising=False)
     monkeypatch.setenv("APP_BASE_PATH", str(tmp_path))
     env_path = Path(tmp_path) / ".env"
     key_path = Path(tmp_path) / "data" / ".encryption_key"

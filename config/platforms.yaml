@@ -29,9 +29,9 @@ youtube:
   max_comments_per_day: 20
   quality_threshold: 0.7
   search_keywords:
-    - "passive income apps"
+    - "passive income"
     - "make money online"
-    - "side hustle 2024"
+    - "side hustle"
   timeouts:
     login_seconds: 90
     post_seconds: 60
