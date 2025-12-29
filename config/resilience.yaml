@@ -13,3 +13,6 @@ resilience:
     critical: true
     retry_attempts: 3
     retry_backoff_seconds: 5
+  health:
+    interval_seconds: 300   # default 5m; adjust to 600 for lower load
+    recovery_interval_seconds: 300

@@ -5,7 +5,7 @@ import importlib
 import logging
 import shutil
 import time
-from datetime import datetime
+from datetime import datetime, UTC
 from pathlib import Path
 from typing import Callable, List, Optional
 
@@ -29,7 +29,7 @@ def backup_sqlite_database(db_path: str, backup_dir: Optional[str] = None) -> Op
 
     target_dir = Path(backup_dir or database_file.parent)
     target_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     backup_file = target_dir / f"{database_file.stem}_backup_{timestamp}{database_file.suffix}"
     shutil.copy2(database_file, backup_file)
     return backup_file
@@ -109,7 +109,7 @@ def run_migrations(engine: Engine, backup_first: bool = True, backup_dir: Option
                     registry.insert().values(
                         version=version,
                         description=description,
-                        applied_at=datetime.utcnow(),
+                        applied_at=datetime.now(UTC),
                         applied_by="system",
                         success=success,
                         error_message=error_message,
