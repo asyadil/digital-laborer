@@ -74,6 +74,7 @@ class SystemOrchestrator:
                 logger=self.logger.getChild("telegram"),
                 log_file_path=self.config_manager.config.logging.file_path,
             )
+            self._validate_config()
             if self.health_checker:
                 self.health_checker.telegram = self.telegram
             if self.alert_manager:
