@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import heapq
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Optional
@@ -87,14 +88,27 @@ class Scheduler:
             self._running = False
 
     async def _run_item(self, item: _ScheduledItem) -> None:
+        start = time.perf_counter()
+        success = True
         try:
             await item.coro_factory()
         except Exception as exc:
+            success = False
             self.logger.error(
                 "Scheduled task failed",
                 extra={"component": "scheduler", "task": item.name, "error": str(exc)},
             )
         finally:
+            duration_ms = int((time.perf_counter() - start) * 1000)
+            self.logger.info(
+                "Scheduled task finished",
+                extra={
+                    "component": "scheduler",
+                    "task": item.name,
+                    "duration_ms": duration_ms,
+                    "success": success,
+                },
+            )
             self._running_tasks.discard(item.name)
 
     async def _wait_any(self, stop_event: asyncio.Event, timeout: Optional[float] = None) -> None:

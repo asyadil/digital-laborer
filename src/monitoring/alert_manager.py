@@ -28,6 +28,7 @@ class AlertManager:
         self._active_alerts: List[Alert] = []
         self._rate_limit: Dict[str, datetime] = {}
         self._rate_limit_window = timedelta(minutes=15)
+        self._last_status: Dict[str, str] = {}
 
     async def process_health_results(self, results: Dict[str, HealthCheckResult]) -> None:
         """Generate alerts from health check results."""
@@ -38,6 +39,10 @@ class AlertManager:
         for key, res in results.items():
             if key == "overall":
                 continue
+            last = self._last_status.get(key)
+            if last == res.status:
+                continue  # no state change, skip alert
+            self._last_status[key] = res.status
             if res.status == "unhealthy":
                 await self.send_alert(
                     alert_type=f"{key}_unhealthy",
@@ -52,14 +57,22 @@ class AlertManager:
                     message=f"{key} degraded",
                     details=res.details,
                 )
+        if overall:
+            last = self._last_status.get("overall")
+            if last != overall.status:
+                self._last_status["overall"] = overall.status
+                if overall.score < 0.5:
+                    await self.send_alert(
+                        alert_type="overall_health",
+                        severity="critical",
+                        message="Overall health below 0.5",
+                        details={"score": overall.score},
+                    )
 
-        if overall and overall.score < 0.5:
-            await self.send_alert(
-                alert_type="overall_health",
-                severity="critical",
-                message="Overall health below 0.5",
-                details={"score": overall.score},
-            )
+    def reset_state(self) -> None:
+        """Reset cached state and rate-limit windows (e.g., on restart)."""
+        self._last_status.clear()
+        self._rate_limit.clear()
 
     async def send_alert(self, alert_type: str, severity: str, message: str, details: Dict[str, Any]) -> None:
         """Send alert with rate limiting."""
