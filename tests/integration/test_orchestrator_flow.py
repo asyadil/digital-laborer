@@ -16,7 +16,7 @@ telegram:
 logging:
   level: INFO
   file_path: logs/test.log
-  format: text
+  format: "%(asctime)s %(levelname)s %(name)s %(message)s"
   max_file_size_mb: 5
   backup_count: 2
 platforms:
@@ -49,7 +49,7 @@ content:
 database:
   type: sqlite
   path: "{db_path}"
-""".format(db_path=str(tmp_path / "test.db")))
+""".format(db_path=str(tmp_path / "test.db").replace("\\", "/")))
 
     orch = SystemOrchestrator(config_path=str(config_path))
 

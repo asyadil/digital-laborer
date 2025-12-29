@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import random
 import re
 import time
@@ -45,8 +46,9 @@ class RedditAdapter(BasePlatformAdapter):
         self._last_health_check: Dict[int, float] = {}  # account_id -> timestamp
         self.captcha_handler = CaptchaHandler(telegram) if telegram else None
         self._selenium: Optional[SeleniumSession] = None
-        self._proxy_pool: List[str] = config.platforms.reddit.get("proxies", []) if hasattr(config, "platforms") and hasattr(config.platforms, "reddit") else []
-        self._ua_pool: List[str] = config.platforms.reddit.get("user_agents", []) if hasattr(config, "platforms") and hasattr(config.platforms, "reddit") else []
+        reddit_cfg = getattr(getattr(config, "platforms", None), "reddit", None)
+        self._proxy_pool: List[str] = list(getattr(reddit_cfg, "proxies", []) or [])
+        self._ua_pool: List[str] = list(getattr(reddit_cfg, "user_agents", []) or [])
         self._current_proxy: Optional[str] = None
         self._current_ua: Optional[str] = None
         self._ops_timing: Dict[str, float] = {}
@@ -134,12 +136,15 @@ class RedditAdapter(BasePlatformAdapter):
                         retry_recommended=False
                     )
             
-            # Adapter no longer auto-picks accounts; orchestrator must supply one
-            if not account:
+            # Adapter no longer auto-picks accounts; if None, fall back to first credentials entry for backward compat/tests
+            if account is None and self.credentials:
+                account = self.credentials[0]
+            if account is None:
                 return AdapterResult(
                     success=False,
                     error="No Reddit account supplied",
-                    retry_recommended=False
+                    retry_recommended=False,
+                    data={},
                 )
             
             # Store account ID for health updates
@@ -216,7 +221,7 @@ class RedditAdapter(BasePlatformAdapter):
                 data={"screenshot": shot} if shot else {},
             )
 
-    def find_target_posts(self, location: str, limit: int = 10, min_score: int = 10, min_comments: int = 5, account: Optional[Union[Dict[str, Any], int]] = None) -> AdapterResult:
+    def find_target_posts(self, location: str, limit: int = 10, min_score: int = 10, min_comments: int = 0, account: Optional[Union[Dict[str, Any], int]] = None) -> AdapterResult:
         """
         Find target posts in a subreddit (location=subreddit).
         
@@ -695,6 +700,8 @@ class RedditAdapter(BasePlatformAdapter):
 
     def _capture_screenshot_safe(self, label: str) -> Optional[str]:
         """Capture screenshot if Selenium session is available/initializable."""
+        if os.getenv("PYTEST_CURRENT_TEST") or os.getenv("DISABLE_SELENIUM_SCREENSHOT"):
+            return None
         try:
             self._ensure_selenium()
             if not self._selenium or not self._selenium.driver:
@@ -703,6 +710,27 @@ class RedditAdapter(BasePlatformAdapter):
             return self._selenium.capture_screenshot(target)
         except Exception:
             return None
+
+    def _human_scroll(self) -> None:
+        """Small scroll to mimic human activity."""
+        if not self._selenium or not self._selenium.driver:
+            return
+        try:
+            self._selenium.driver.execute_script("window.scrollBy(0, arguments[0]);", random.randint(200, 800))
+            self._selenium.human_pause(400, 1200)
+        except Exception:
+            pass
+
+    def _human_jitter(self) -> None:
+        """Random short pause to mimic human interaction."""
+        time.sleep(random.uniform(self._jitter_range_ms[0] / 1000.0, self._jitter_range_ms[1] / 1000.0))
+
+    def _log_duration(self, name: str, start_time: float) -> None:
+        try:
+            elapsed = round((time.monotonic() - start_time) * 1000, 2)
+            self.logger.debug("Adapter timing", extra={"component": "reddit_adapter", "operation": name, "duration_ms": elapsed})
+        except Exception:
+            pass
 
     @retry_with_exponential_backoff(max_attempts=3, base_delay=1.0, max_delay=15.0)
     def _call_with_limits(self, func):

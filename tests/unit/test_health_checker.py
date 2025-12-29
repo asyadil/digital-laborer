@@ -1,4 +1,5 @@
 import contextlib
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -48,4 +49,8 @@ def new_checker(active_accounts, flagged_accounts):
 
 def test_check_platforms_no_active_accounts():
     checker = new_checker(active_accounts=[], flagged_accounts=[])
-    result = pytest.run(asyncio_run(checker.check_platform_adapters()))
+    result = asyncio.run(checker.check_platform_adapters())
+    # For no active accounts, a single HealthCheckResult is returned (platforms component)
+    from src.monitoring.health_checker import HealthCheckResult
+    assert isinstance(result, HealthCheckResult)
+    assert result.status in {"degraded", "unhealthy"}

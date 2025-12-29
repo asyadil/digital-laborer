@@ -31,6 +31,12 @@ if [ ! -f "$CONFIG_PATH" ]; then
   exit 1
 fi
 
+# Validate systemd availability
+if ! command -v systemctl >/dev/null 2>&1; then
+  echo "systemd not available on this system. Skipping service install." >&2
+  exit 1
+fi
+
 # Create systemd unit
 cat <<EOF | sudo tee /etc/systemd/system/$SERVICE_NAME.service >/dev/null
 [Unit]
