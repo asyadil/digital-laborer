@@ -52,10 +52,15 @@ class AccountStatus(enum.Enum):
 
 
 class PostStatus(enum.Enum):
-    pending = "pending"
-    posted = "posted"
-    flagged = "flagged"
-    removed = "removed"
+    """Post lifecycle status."""
+
+    PENDING = "pending"
+    APPROVED = "approved"
+    POSTING = "posting"
+    POSTED = "posted"
+    FLAGGED = "flagged"
+    REMOVED = "removed"
+    FAILED = "failed"
 
 
 class Account(Base, TimestampMixin):
@@ -66,7 +71,9 @@ class Account(Base, TimestampMixin):
     username: Mapped[str] = mapped_column(String(150), nullable=False)
     email: Mapped[Optional[str]] = mapped_column(String(255))
     password_encrypted: Mapped[str] = mapped_column(String(512), nullable=False)
-    status: Mapped[AccountStatus] = mapped_column(Enum(AccountStatus), nullable=False, index=True)
+    status: Mapped[AccountStatus] = mapped_column(
+        Enum(AccountStatus), nullable=False, index=True, default=AccountStatus.active
+    )
     last_used: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     total_posts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     total_conversions: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
@@ -91,19 +98,23 @@ class Post(Base, TimestampMixin):
     platform: Mapped[str] = mapped_column(String(50), index=True, nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     url: Mapped[Optional[str]] = mapped_column(String(512))
+    external_id: Mapped[Optional[str]] = mapped_column(String(255))
     posted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), index=True)
-    status: Mapped[PostStatus] = mapped_column(Enum(PostStatus), default=PostStatus.pending, index=True)
+    status: Mapped[PostStatus] = mapped_column(Enum(PostStatus), default=PostStatus.PENDING, index=True)
     clicks: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     conversions: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     quality_score: Mapped[Optional[float]] = mapped_column(Float)
+    quality_breakdown: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON)
     human_approved: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     metadata_json: Mapped[Optional[Dict[str, Any]]] = mapped_column("metadata", JSON)
+    error_message: Mapped[Optional[str]] = mapped_column(Text)
 
     account: Mapped[Account] = relationship("Account", back_populates="posts")
 
     __table_args__ = (
         Index("ix_posts_platform_status", "platform", "status"),
         Index("ix_posts_account", "account_id", "posted_at"),
+        Index("ix_posts_posted_at_platform", "posted_at", "platform"),
     )
 
 

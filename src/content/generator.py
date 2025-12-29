@@ -28,7 +28,13 @@ _LINK_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 
 
 class ContentGenerator:
-    def __init__(self, config: Any, templates: TemplateManager, synonyms: Dict[str, List[str]]) -> None:
+    def __init__(
+        self,
+        config: Any,
+        templates: TemplateManager,
+        synonyms: Dict[str, List[str]],
+        referral_links: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
         self.config = config
         self.templates = templates
         self.paraphraser = RuleBasedParaphraser(synonyms=synonyms, seed=1337)
@@ -36,11 +42,17 @@ class ContentGenerator:
             min_length=int(getattr(config.content, "min_length", 200)),
             max_length=int(getattr(config.content, "max_length", 800)),
         )
+        self.referral_links = referral_links or []
 
     def generate_reddit_comment(self, subreddit: str, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         return self._generate(
             platform="reddit",
-            context={"subreddit": subreddit, **(context or {})},
+            context={
+                "subreddit": subreddit,
+                "tone": "practical",
+                "referral_link": (context or {}).get("referral_link") if context else self._default_referral_link("reddit"),
+                **(context or {}),
+            },
             min_words=200,
             max_words=500,
         )
@@ -49,7 +61,13 @@ class ContentGenerator:
         topic = self._extract_topic(video_title + " " + (video_description or ""))
         return self._generate(
             platform="youtube",
-            context={"video_title": video_title, "topic": topic, "video_description": video_description},
+            context={
+                "video_title": video_title,
+                "topic": topic,
+                "video_description": video_description,
+                "cta": "If you want the walkthrough + link, check the first reply — happy to share what worked for me.",
+                "referral_link": (context or {}).get("referral_link") if context else self._default_referral_link("youtube"),
+            },
             min_words=150,
             max_words=400,
         )
@@ -62,6 +80,13 @@ class ContentGenerator:
                 "question": question,
                 "topic": topic,
                 "existing_answers_summary": existing_answers_summary,
+                "structure": [
+                    "**Intro**: brief hook answering the question plainly.",
+                    "**Body**: 3-5 sections with steps, examples, pitfalls.",
+                    "**Conclusion**: recap + next step + referral placement.",
+                ],
+                "referral_links": self._referral_links_for("quora", limit=2),
+                "cta": "If you want a starter bundle with tools and the referral link I used, ask and I’ll share.",
             },
             min_words=800,
             max_words=2000,
@@ -83,11 +108,13 @@ class ContentGenerator:
     def _generate(self, platform: str, context: Dict[str, Any], min_words: int, max_words: int) -> Dict[str, Any]:
         errors: List[str] = []
         warnings: List[str] = []
+        ctx = dict(context)
+        ctx["platform"] = platform
 
         try:
             seed = self._stable_seed(platform, context)
             tpl = self.templates.pick_template(platform=platform, seed=seed)
-            raw = self.templates.render(tpl.text, context=context)
+            raw = self.templates.render(tpl.text, context=ctx)
         except (TemplateError, Exception) as exc:
             tpl = None
             raw = ""
@@ -98,7 +125,7 @@ class ContentGenerator:
             warnings.append("Used fallback template")
 
         # Ensure there is at least one helpful link placeholder if config provides it.
-        raw = self._inject_links(raw, context)
+        raw = self._inject_links(raw, ctx)
 
         # Paraphrase lightly for variation
         try:
@@ -107,14 +134,20 @@ class ContentGenerator:
             paraphrased = raw
             warnings.append(f"paraphrase_failed: {exc}")
 
-        normalized = self._normalize_whitespace(paraphrased)
+        structured = self._apply_platform_structure(platform, paraphrased, ctx)
+        normalized = self._normalize_whitespace(structured)
         trimmed = self._enforce_word_range(normalized, min_words=min_words, max_words=max_words)
 
         qa = self.scorer.assess(trimmed)
+        spam_hits = self._spam_indicators(trimmed)
+        if spam_hits:
+            warnings.append(f"spam_indicators: {', '.join(spam_hits)}")
+
+        sanitized = self._sanitize_output(trimmed)
 
         return {
             "platform": platform,
-            "content": trimmed,
+            "content": sanitized,
             "quality": {"score": qa.score, "breakdown": qa.breakdown, "suggestions": qa.suggestions},
             "template_id": tpl.template_id if tpl else None,
             "errors": errors,
@@ -125,24 +158,19 @@ class ContentGenerator:
         if platform == "reddit":
             sub = context.get("subreddit") or ""
             return (
-                f"I\'ve tried a bunch of approaches over the years, and what worked best for me was treating it like an experiment: "
-                f"track what you do, keep the risk low, and focus on consistency. In r/{sub}, people usually respond well to practical steps: "
-                f"start small, measure results, and iterate. If you\'re exploring low-effort ways to get started, I\'d recommend picking one method, "
-                f"doing it for two weeks, and writing down what actually moved the needle."
+                f"In r/{sub}, the posts that last are practical and human. I keep it simple: one actionable step, one personal detail, and one optional resource. "
+                f"Track what you do for 10-14 days, note the response, and adjust tone before adding any link."
             )
         if platform == "youtube":
             title = context.get("video_title") or "this video"
             return (
-                f"Really enjoyed {title}. I went through a similar phase where I tried too many things at once and got nowhere. "
-                f"What helped was choosing one simple routine, sticking to it daily, and keeping expectations realistic. If anyone\'s new to this, "
-                f"start with something you can actually maintain for 15 minutes a day and build from there."
+                f"I liked {title} because it’s honest about the effort. What worked for me was one small routine for 14 days and a single polite CTA at the end. "
+                f"Happy to share the exact line + link if useful."
             )
         if platform == "quora":
             q = context.get("question") or "the question"
             return (
-                f"Here\'s a structured way to think about {q}: start by defining your constraints (time, risk tolerance, skills), then pick a method "
-                f"that matches them. In the beginning, the most important factor is consistency. Once you have a baseline routine, you can optimize. "
-                f"I\'ll break this down into a practical plan below, including common mistakes and how to avoid them."
+                f"Here's a structured way to answer {q}: start with constraints (time, risk, skills), give 3-5 steps with an example metric, close with a recap and an offer to share resources."
             )
         return ""
 
@@ -209,5 +237,96 @@ class ContentGenerator:
         # If context provides referral_link, insert once.
         link = context.get("referral_link")
         if isinstance(link, str) and link.startswith("http"):
-            return text + f"\n\nHelpful resource: {link}"
+            return text + f"\n\nHelpful resource: {self._sanitize_link(link)}"
+        # Fallback to default platform link if available
+        platform = context.get("platform")
+        default_link = self._default_referral_link(platform) if platform else None
+        if default_link:
+            return text + f"\n\nHelpful resource: {self._sanitize_link(default_link)}"
         return text
+
+    def _spam_indicators(self, text: str) -> List[str]:
+        lower = text.lower()
+        hits: List[str] = []
+        for phrase in ["guaranteed", "100%", "act now", "risk free", "click here", "limited time"]:
+            if phrase in lower:
+                hits.append(phrase)
+        if lower.count("http") > 2:
+            hits.append("too_many_links")
+        return hits
+
+    def _apply_platform_structure(self, platform: str, text: str, context: Dict[str, Any]) -> str:
+        """Apply platform-specific formatting before scoring/length enforcement."""
+        if platform != "quora":
+            return text
+
+        question = context.get("question") or ""
+        structure = context.get("structure") or []
+        referral_links = context.get("referral_links") or []
+
+        # Build intro, body, conclusion slots
+        intro = structure[0] if structure else "**Intro**"
+        body = structure[1] if len(structure) > 1 else "**Body**"
+        conclusion = structure[2] if len(structure) > 2 else "**Conclusion**"
+
+        intro_block = f"{intro}\n- Question: {question}\n- Constraint: time/skill/risk briefly set\n"
+        body_block = f"{body}\n- Step 1: context-specific action\n- Step 2: example with small metric\n- Step 3: common pitfall + fix\n"
+
+        # Insert referral links naturally in body if provided
+        if referral_links:
+            safe_links = [self._sanitize_link(link) for link in referral_links if isinstance(link, str) and link.startswith("http")]
+            if safe_links:
+                mid_link = safe_links[0]
+                body_block += f"- Resource: {mid_link}\n"
+                if len(safe_links) > 1:
+                    body_block += f"- Bonus: {safe_links[1]}\n"
+
+        conclusion_block = f"{conclusion}\n- Recap main actionable\n- Next step for reader\n- Offer to share more resources on request\n{context.get('cta','')}\n"
+
+        return "\n".join([intro_block.strip(), body_block.strip(), conclusion_block.strip()])
+
+    def _sanitize_link(self, link: str) -> str:
+        return re.sub(r"[\\s<>\"']", "", link).strip()
+
+    def _sanitize_output(self, text: str) -> str:
+        """Basic sanitation to avoid injection/formatting issues (Markdown-safe)."""
+        # Remove control characters
+        text = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", "", text)
+        # Escape basic Markdown special chars
+        for ch in ["`", "*", "_", "[", "]", "(", ")", "~", "#", "+", "-", "|"]:
+            text = text.replace(ch, f"\\{ch}")
+        return text.strip()
+
+    def _default_referral_link(self, platform: Optional[str]) -> Optional[str]:
+        """Pick first active referral link for the platform if provided."""
+        if not platform:
+            return None
+        for item in self.referral_links:
+            if not isinstance(item, dict):
+                continue
+            if not item.get("active", True):
+                continue
+            name = str(item.get("platform_name", "")).lower()
+            if platform.lower() in name:
+                url = item.get("url")
+                if isinstance(url, str) and url.startswith("http"):
+                    return url
+        return None
+
+    def _referral_links_for(self, platform: Optional[str], limit: int = 2) -> List[str]:
+        if not platform:
+            return []
+        selected: List[str] = []
+        for item in self.referral_links:
+            if not isinstance(item, dict):
+                continue
+            if not item.get("active", True):
+                continue
+            name = str(item.get("platform_name", "")).lower()
+            if platform.lower() in name or name in ("generic", "all"):
+                url = item.get("url")
+                if isinstance(url, str) and url.startswith("http"):
+                    selected.append(url)
+            if len(selected) >= limit:
+                break
+        return selected

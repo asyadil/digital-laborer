@@ -1,0 +1,41 @@
+referral_links:
+  - platform_name: "Brave"
+    url: "https://brave.com/ref/sample"
+    category: "browser"
+    commission_rate: 5.0
+    active: true
+    clicks: 0
+    conversions: 0
+    earnings: 0.0
+  - platform_name: "Rakuten"
+    url: "https://www.rakuten.com/r/SAMPLE"
+    category: "cashback"
+    commission_rate: 4.0
+    active: true
+    clicks: 0
+    conversions: 0
+    earnings: 0.0
+  - platform_name: "HoneyGain"
+    url: "https://r.honeygain.me/SAMPLE"
+    category: "passive_income"
+    commission_rate: 10.0
+    active: true
+    clicks: 0
+    conversions: 0
+    earnings: 0.0
+  - platform_name: "Swagbucks"
+    url: "https://www.swagbucks.com/p/register?rb=SAMPLE"
+    category: "surveys"
+    commission_rate: 3.0
+    active: true
+    clicks: 0
+    conversions: 0
+    earnings: 0.0
+  - platform_name: "UserTesting"
+    url: "https://www.usertesting.com/signup?ref=SAMPLE"
+    category: "testing"
+    commission_rate: 15.0
+    active: true
+    clicks: 0
+    conversions: 0
+    earnings: 0.0

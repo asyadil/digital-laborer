@@ -1,0 +1,57 @@
+reddit:
+  enabled: true
+  auto_post_after_approval: false
+  max_posts_per_day: 15
+  min_delay_between_posts: 600
+  max_delay_between_posts: 1800
+  quality_threshold: 0.7
+  subreddits:
+    - "beermoney"
+    - "passive_income"
+    - "sidehustle"
+  oauth:
+    client_id: ${REDDIT_CLIENT_ID}
+    client_secret: ${REDDIT_CLIENT_SECRET}
+    user_agent: ${REDDIT_USER_AGENT}
+    username: ${REDDIT_USERNAME}
+    password: ${REDDIT_PASSWORD}
+  timeouts:
+    login_seconds: 60
+    post_seconds: 45
+    find_seconds: 30
+  backoff:
+    max_attempts: 3
+    base_delay: 5
+    max_delay: 60
+
+youtube:
+  enabled: true
+  max_comments_per_day: 20
+  quality_threshold: 0.7
+  search_keywords:
+    - "passive income apps"
+    - "make money online"
+    - "side hustle 2024"
+  timeouts:
+    login_seconds: 90
+    post_seconds: 60
+    search_seconds: 30
+  oauth:
+    client_id: ${YOUTUBE_CLIENT_ID}
+    client_secret: ${YOUTUBE_CLIENT_SECRET}
+    refresh_token: ${YOUTUBE_REFRESH_TOKEN}
+
+quora:
+  enabled: true
+  max_answers_per_day: 5
+  quality_threshold: 0.75
+  topics:
+    - "Passive Income"
+    - "Side Hustles"
+  timeouts:
+    login_seconds: 120
+    post_seconds: 90
+    find_seconds: 45
+  credentials:
+    email: ${QUORA_EMAIL}
+    password: ${QUORA_PASSWORD}

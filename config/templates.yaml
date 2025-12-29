@@ -1,54 +1,575 @@
 templates:
+  # Reddit (15)
   - id: reddit_experience_1
     platform: reddit
     name: Experience reply
-    min_words: 200
-    max_words: 500
+    min_words: 220
+    max_words: 420
     text: |
       {% if subreddit %}
-      I’ve been following r/{{subreddit}} for a while, and one thing I’ve noticed is that most people get better results when they keep it practical.
+      Been in r/{{subreddit}} long enough to notice the posts that help most are practical, not hype.
       {% endif %}
-      
-      What worked for me was starting with one simple routine, tracking it for two weeks, and only then adding complexity.
-      
-      If your goal is something sustainable, think in terms of repeatable steps:
+      What worked for me: one small experiment for 14 days, track, then adjust.
       - pick one approach
       - measure a basic outcome
       - improve one part at a time
-      
-      The “boring” approach usually wins long-term.
+      The “boring” routine wins long-term.
+  - id: reddit_experience_2
+    platform: reddit
+    name: Checklist
+    min_words: 220
+    max_words: 420
+    text: |
+      Quick checklist I use before posting:
+      - Is it specific to this community?
+      - Is there a replicable step?
+      - Did I add one data point (time saved, $ saved, clicks)?
+      If yes, I post. If not, I trim fluff and keep it lean.
+  - id: reddit_experience_3
+    platform: reddit
+    name: Side-hustle angle
+    min_words: 220
+    max_words: 420
+    text: |
+      I treat every side-hustle test like a mini sprint:
+      1) Define a 30-minute daily action
+      2) Track for 10 days
+      3) Kill or double-down
+      Keeps me honest and avoids chasing shiny objects.
+  - id: reddit_experience_4
+    platform: reddit
+    name: Metrics-driven
+    min_words: 220
+    max_words: 420
+    text: |
+      Sharing metrics because they helped me decide:
+      - Time spent/day: {{time_spent|default("20-30m")}}
+      - Cost: {{cost|default("$0-10")}}
+      - Result: {{result|default("first 3 signups")}}
+      If you track these three, you’ll know within 2 weeks if it’s worth it.
+  - id: reddit_experience_5
+    platform: reddit
+    name: Friendly caution
+    min_words: 220
+    max_words: 420
+    text: |
+      Friendly caution: most bans come from posting too fast or too promotional.
+      Pace it (1-2 comments/day), add one personal detail, and avoid stacked links.
+      Works better and keeps accounts healthy.
+  - id: reddit_experience_6
+    platform: reddit
+    name: Story snapshot
+    min_words: 220
+    max_words: 420
+    text: |
+      Quick snapshot: I tested {{topic|default("an app")}} for 12 days.
+      What clicked: consistent posting, 1 helpful link max, replying to every comment with context.
+      Outcome: small but steady conversions; zero mod removals.
+  - id: reddit_experience_7
+    platform: reddit
+    name: Do/Don’t list
+    min_words: 220
+    max_words: 420
+    text: |
+      Do:
+      - Post after reading top 5 threads to match tone
+      - Add 1 concrete step + 1 personal detail
+      - Leave room for questions
+      Don’t:
+      - Drop multiple links
+      - Copy-paste across subs
+      - Ignore subreddit rules
+  - id: reddit_experience_8
+    platform: reddit
+    name: Minimal template
+    min_words: 200
+    max_words: 350
+    text: |
+      TL;DR: kept it simple → one clear step, one link, one offer to help.
+      That alone cut removals for me. If you want details, I’ll outline the exact 3 steps.
+  - id: reddit_experience_9
+    platform: reddit
+    name: Question-led
+    min_words: 220
+    max_words: 420
+    text: |
+      Anyone here tried {{topic|default("this approach")}}? My routine:
+      - Small daily action (15-20m)
+      - Track one metric (clicks or replies)
+      - Adjust weekly
+      Happy to share my template if useful.
+  - id: reddit_experience_10
+    platform: reddit
+    name: Rules-first
+    min_words: 220
+    max_words: 420
+    text: |
+      I always check 3 things before posting here:
+      1) Sub rules on links/self-promo
+      2) Recent removals trend
+      3) Tone of top comments
+      It sounds slow, but it’s kept my accounts unflagged.
+  - id: reddit_experience_11
+    platform: reddit
+    name: Weekend vs weekday
+    min_words: 220
+    max_words: 420
+    text: |
+      I split tests: weekdays = how-to; weekends = story + metric.
+      Weekend posts with one data point (“saved $12” or “12 clicks”) worked best.
+  - id: reddit_experience_12
+    platform: reddit
+    name: Short primer
+    min_words: 200
+    max_words: 350
+    text: |
+      Primer I send friends:
+      - Pick one tactic
+      - Do it 10 days
+      - Post a small win or lesson
+      Low effort, keeps bans away.
+  - id: reddit_experience_13
+    platform: reddit
+    name: Anti-spam tone
+    min_words: 220
+    max_words: 420
+    text: |
+      To avoid spammy vibe I use:
+      - Plain language
+      - One link max, placed mid/late paragraph
+      - Offer to DM details
+      Mods seem fine when it’s framed as “here’s what I did” not “buy this”.
+  - id: reddit_experience_14
+    platform: reddit
+    name: Micro-case
+    min_words: 220
+    max_words: 420
+    text: |
+      Mini case study:
+      - Context: {{context|default("testing a rewards app")}}
+      - Steps: track 10 days, log clicks, tweak wording
+      - Result: {{result|default("click-through from 2% to 4%")}}
+      If you want the exact copy I used, I can drop it.
+  - id: reddit_experience_15
+    platform: reddit
+    name: FAQ style
+    min_words: 220
+    max_words: 420
+    text: |
+      Common Qs I get:
+      - Does it work without spending? Yes, start with free trials.
+      - Safe for new accounts? Pace posting, avoid multiple links.
+      - How long to see results? Expect ~10-14 days.
+      Happy to share my script if helpful.
 
+  # YouTube (15)
   - id: youtube_story_1
     platform: youtube
     name: Personal story
-    min_words: 150
-    max_words: 400
+    min_words: 180
+    max_words: 360
     text: |
-      I liked this video because it’s honest about the work involved.
-      
-      When I first tried to learn {{topic}}, I made the mistake of jumping between methods.
-      What helped me was sticking to one plan for 14 days and writing down what actually worked.
-      
-      If anyone is new, start small and focus on consistency.
+      Loved this video — it’s honest about the work.
+      I bounced between methods learning {{topic}}, got nowhere.
+      Stuck to one plan for 14 days, wrote what worked.
+      If you want a light, repeatable routine, start small and stay daily.
+      {{cta}}
+  - id: youtube_story_2
+    platform: youtube
+    name: 3-step CTA
+    min_words: 180
+    max_words: 360
+    text: |
+      Here’s a 3-step version that worked for me:
+      1) One micro-task per day (15-20m)
+      2) Track one metric (clicks/response)
+      3) Tweak wording weekly
+      I can share the script + link I used if you want it.
+      {{cta}}
+  - id: youtube_story_3
+    platform: youtube
+    name: Light anecdote
+    min_words: 180
+    max_words: 360
+    text: |
+      Quick anecdote: I tried {{topic}} casually, failed, then set a 10-day rule.
+      After day 6 the replies improved once I used one personal detail + one helpful link.
+      If anyone needs the wording, I’ve got it saved.
+      {{cta}}
+  - id: youtube_story_4
+    platform: youtube
+    name: Before/after
+    min_words: 180
+    max_words: 360
+    text: |
+      Before: scattered, posting random tips.
+      After: one niche, one CTA, one link near the end.
+      Results: calmer replies, better click-through.
+      Can share the exact line I used; just ask.
+      {{cta}}
+  - id: youtube_story_5
+    platform: youtube
+    name: Starter kit
+    min_words: 180
+    max_words: 360
+    text: |
+      If you’re new to {{topic}}, try:
+      - 1 habit you can do daily
+      - 1 mini story that shows you did it
+      - 1 link offered politely
+      It’s simple but survives moderation.
+      {{cta}}
+  - id: youtube_story_6
+    platform: youtube
+    name: Empathy tone
+    min_words: 180
+    max_words: 360
+    text: |
+      I get why people hesitate here — lots of hype.
+      What helped me was writing one honest story + one actionable tip.
+      If you want the wording, I can share it, along with the referral link I used.
+      {{cta}}
+  - id: youtube_story_7
+    platform: youtube
+    name: Metric nudge
+    min_words: 180
+    max_words: 360
+    text: |
+      Sharing a small metric: {{metric|default("first 5 clicks in 3 days")}}.
+      Came from one clear CTA and a short anecdote.
+      If you want the script, reply and I’ll paste it.
+      {{cta}}
+  - id: youtube_story_8
+    platform: youtube
+    name: Objection handler
+    min_words: 180
+    max_words: 360
+    text: |
+      Objection I had: “Will this get flagged?”
+      What reduced flags: one link, positioned after value, no bold claims.
+      I can share the line I used that passed filters.
+      {{cta}}
+  - id: youtube_story_9
+    platform: youtube
+    name: Fast draft
+    min_words: 180
+    max_words: 320
+    text: |
+      Fast draft I use:
+      - Hook: what I tried
+      - 2 lines of outcome
+      - Offer to share details/link if useful
+      Keeps it human and short.
+      {{cta}}
+  - id: youtube_story_10
+    platform: youtube
+    name: Soft CTA
+    min_words: 180
+    max_words: 320
+    text: |
+      Instead of hard selling, I offer to share my notes.
+      “If you want the walkthrough I used, I can drop it below with the link.”
+      That phrasing got better replies and fewer removals.
+      {{cta}}
+  - id: youtube_story_11
+    platform: youtube
+    name: Routine share
+    min_words: 180
+    max_words: 360
+    text: |
+      My routine for {{topic}}:
+      - 10-15m/day
+      - One experiment at a time
+      - Weekly tweak
+      It’s slow but keeps accounts safe. Can paste my CTA + link if you want.
+      {{cta}}
+  - id: youtube_story_12
+    platform: youtube
+    name: Micro-guide
+    min_words: 180
+    max_words: 360
+    text: |
+      Mini guide that got me started:
+      - Define one repeatable action
+      - Track clicks/replies
+      - Place link mid-comment, not at start
+      Want the template? I’ll share it.
+      {{cta}}
+  - id: youtube_story_13
+    platform: youtube
+    name: Value-first
+    min_words: 180
+    max_words: 360
+    text: |
+      Value-first approach:
+      - Give the step
+      - Share your metric
+      - Offer link if helpful
+      Avoids “spam” tags. I can paste the exact line I used.
+      {{cta}}
+  - id: youtube_story_14
+    platform: youtube
+    name: Results blurb
+    min_words: 180
+    max_words: 360
+    text: |
+      Results blurb: “Tried X for 10 days, got Y. If you want my notes + link, I’ll share.”
+      This phrasing felt natural and didn’t get flagged.
+      {{cta}}
+  - id: youtube_story_15
+    platform: youtube
+    name: Helpful follow-up
+    min_words: 180
+    max_words: 360
+    text: |
+      I usually follow up with a small FAQ in replies.
+      Keeps the thread active and lets me share the link naturally there.
+      Can paste my follow-up template if you want.
+      {{cta}}
 
+  # Quora (20)
   - id: quora_structured_1
     platform: quora
     name: Structured answer
-    min_words: 800
-    max_words: 2000
+    min_words: 900
+    max_words: 1600
     text: |
       Here’s a structured answer to: {{question}}
-      
-      **1) Quick analysis**
-      The core of your question is really about constraints: time, risk tolerance, and how consistent you can be.
-      
-      **2) A practical framework**
-      - Define your available time per day
-      - Choose one method that matches your skills
-      - Track results weekly
-      
-      **3) Common mistakes**
-      People often chase shortcuts, over-optimize too early, or quit before they have a baseline.
-      
-      **4) Conclusion**
-      Start simple, measure, then iterate.
+      **Intro**: summarize the intent and constraint (time, risk, skill).
+      **Body**: 3-5 sections with steps, examples, pitfalls.
+      **Conclusion**: recap + next step + offer to share referral resources.
+      {{cta}}
+  - id: quora_structured_2
+    platform: quora
+    name: Step-by-step
+    min_words: 900
+    max_words: 1600
+    text: |
+      Let’s break {{question}} into steps:
+      1) Define constraints (time, budget, risk)
+      2) Pick one method and scope for 14 days
+      3) Measure one outcome
+      4) Adjust weekly
+      If you want my starter kit + links, I can share.
+      {{cta}}
+  - id: quora_structured_3
+    platform: quora
+    name: Comparative
+    min_words: 900
+    max_words: 1600
+    text: |
+      Comparing two approaches to {{topic}}:
+      - Approach A: pros/cons, time, cost
+      - Approach B: pros/cons, time, cost
+      Verdict: when to choose which.
+      Happy to drop my templates + referral link if helpful.
+      {{cta}}
+  - id: quora_structured_4
+    platform: quora
+    name: Case outline
+    min_words: 900
+    max_words: 1600
+    text: |
+      Case outline:
+      - Context: {{context|default("beginner with limited time")}}
+      - Plan: one experiment for 10-14 days
+      - Measure: clicks/conversions/time saved
+      - Adjust: tighten copy + pacing
+      If you want my scripts + link, ask and I’ll share.
+      {{cta}}
+  - id: quora_structured_5
+    platform: quora
+    name: Mistakes/avoid
+    min_words: 900
+    max_words: 1600
+    text: |
+      Common mistakes on {{question}}:
+      - Chasing too many tactics
+      - Dropping links too early
+      - Ignoring pacing
+      Fix: focus, human tone, 1 link after value.
+      I can share my safe wording + referral.
+      {{cta}}
+  - id: quora_structured_6
+    platform: quora
+    name: Playbook
+    min_words: 900
+    max_words: 1600
+    text: |
+      Quick playbook:
+      - Week 1: research + tone matching
+      - Week 2: single experiment + log
+      - Week 3: scale or stop
+      Want the checklist + links I used? Let me know.
+      {{cta}}
+  - id: quora_structured_7
+    platform: quora
+    name: FAQ style
+    min_words: 900
+    max_words: 1600
+    text: |
+      FAQ:
+      - Does this need budget? Minimal if you start with free tiers.
+      - Will this be flagged? Pace and place link late.
+      - How long to see signal? ~10-14 days.
+      I can paste the copy that passed filters.
+      {{cta}}
+  - id: quora_structured_8
+    platform: quora
+    name: Toolkit
+    min_words: 900
+    max_words: 1600
+    text: |
+      Toolkit I used:
+      - Tracking: simple sheet
+      - Copy: value-first, 1 link mid-body
+      - Timing: spaced posts, human reply latency
+      Want my template + referral pack? Ask below.
+      {{cta}}
+  - id: quora_structured_9
+    platform: quora
+    name: Narrative
+    min_words: 900
+    max_words: 1600
+    text: |
+      Narrative angle:
+      - Where I started
+      - What I tried
+      - What worked
+      - What I’d repeat
+      Keeps it human and avoids mod flags. I can share scripts + links if useful.
+      {{cta}}
+  - id: quora_structured_10
+    platform: quora
+    name: Hybrid (list + story)
+    min_words: 900
+    max_words: 1600
+    text: |
+      Hybrid format:
+      - Short intro
+      - Bullet steps with specifics
+      - One short story
+      - CTA to share resources
+      This has survived moderation reliably for me.
+      {{cta}}
+  - id: quora_structured_11
+    platform: quora
+    name: Risk-managed
+    min_words: 900
+    max_words: 1600
+    text: |
+      For {{question}} with low risk tolerance:
+      - Start with zero-cost methods
+      - Add only one link, late
+      - Rotate phrasing weekly
+      Want examples? I’ll share my wording + referral link.
+      {{cta}}
+  - id: quora_structured_12
+    platform: quora
+    name: Time-constrained
+    min_words: 900
+    max_words: 1600
+    text: |
+      If you have little time:
+      - 15m/day: one action
+      - Track one metric
+      - Weekly review
+      I can provide a ready-to-use script and link that fit this schedule.
+      {{cta}}
+  - id: quora_structured_13
+    platform: quora
+    name: Conversion-focused
+    min_words: 900
+    max_words: 1600
+    text: |
+      For conversions, I focus on:
+      - Relevance to question
+      - One proof point
+      - Soft CTA with optional link
+      I have a tested snippet; happy to paste it.
+      {{cta}}
+  - id: quora_structured_14
+    platform: quora
+    name: Anti-spam
+    min_words: 900
+    max_words: 1600
+    text: |
+      Anti-spam measures:
+      - Avoid hype phrases
+      - Place link after value
+      - Offer to DM details
+      This keeps answers up. I can share the wording I use.
+      {{cta}}
+  - id: quora_structured_15
+    platform: quora
+    name: Data point
+    min_words: 900
+    max_words: 1600
+    text: |
+      Data point format:
+      - Context
+      - Action taken
+      - Metric (clicks/conversions/time)
+      - What to replicate
+      Want the template + link? Ask below.
+      {{cta}}
+  - id: quora_structured_16
+    platform: quora
+    name: Comparison short
+    min_words: 900
+    max_words: 1600
+    text: |
+      Short compare:
+      - Option A: when to use, expected result
+      - Option B: when to use, expected result
+      - CTA: offer resources
+      I can share the exact copy + referral if you want.
+      {{cta}}
+  - id: quora_structured_17
+    platform: quora
+    name: Beginner-friendly
+    min_words: 900
+    max_words: 1600
+    text: |
+      Beginner path:
+      - One simple routine
+      - No-spend start
+      - Track one metric
+      I’ll share my scripts + links if you’re starting from zero.
+      {{cta}}
+  - id: quora_structured_18
+    platform: quora
+    name: Advanced tweak
+    min_words: 900
+    max_words: 1600
+    text: |
+      For advanced tweaks:
+      - Add light paraphrasing
+      - Rotate CTA wording weekly
+      - Use one contextual link
+      Want my rotation set? I can provide it.
+      {{cta}}
+  - id: quora_structured_19
+    platform: quora
+    name: Troubleshooting
+    min_words: 900
+    max_words: 1600
+    text: |
+      If answers get removed:
+      - Reduce links
+      - Move CTA to end
+      - Add personal proof
+      I can share the “safe” variant + referral link I use.
+      {{cta}}
+  - id: quora_structured_20
+    platform: quora
+    name: Outcome-first
+    min_words: 900
+    max_words: 1600
+    text: |
+      Outcome-first:
+      - Lead with result
+      - Then steps
+      - Then offer resources
+      Keeps readers hooked. I’ll paste the template + link on request.
+      {{cta}}

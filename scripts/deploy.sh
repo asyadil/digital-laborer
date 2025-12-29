@@ -32,25 +32,23 @@ if [ ! -f "$CONFIG_PATH" ]; then
 fi
 
 # Create systemd unit
-cat <<'EOF' | sudo tee /etc/systemd/system/$SERVICE_NAME.service >/dev/null
+cat <<EOF | sudo tee /etc/systemd/system/$SERVICE_NAME.service >/dev/null
 [Unit]
 Description=Referral Automation Bot
 After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/%HOLDER%
-ExecStart=%h/%HOLDER%/.venv/bin/python -m src.main
+WorkingDirectory=${APP_DIR}
+ExecStart=${VENV_DIR}/bin/python -m src.core.orchestrator ${CONFIG_PATH}
 Restart=always
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
+Environment=LOG_FILE=${LOG_FILE}
 
 [Install]
 WantedBy=multi-user.target
 EOF
-
-# Replace placeholders with actual app dir
-sudo sed -i "s|%h/%HOLDER%|$APP_DIR|g" /etc/systemd/system/$SERVICE_NAME.service
 
 sudo systemctl daemon-reload
 sudo systemctl enable $SERVICE_NAME

@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+import random
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -34,10 +35,11 @@ from src.platforms.base_adapter import (
     PlatformAdapterError,
     RateLimitError,
 )
-from src.platforms.selenium_session import SeleniumSession
+from src.platforms.selenium_session import SeleniumSession, SeleniumSessionConfig
 from src.utils.rate_limiter import FixedWindowRateLimiter
 from src.platforms.captcha_handler import CaptchaHandler
 from src.utils.retry import retry_with_exponential_backoff
+from src.utils.user_agents import pick_random_user_agent
 
 
 class QuoraAdapter(BasePlatformAdapter):
@@ -53,17 +55,29 @@ class QuoraAdapter(BasePlatformAdapter):
         self._browser_type = config.get('browser', 'chrome')
         self._headless = config.get('headless', True)
         self._timeout = config.get('timeout_seconds', 30)
+        self._proxy_pool = config.get("proxies", [])
+        self._ua_pool = config.get("user_agents", [])
+        self._current_proxy: Optional[str] = None
+        self._current_ua: Optional[str] = None
         self.captcha_handler = CaptchaHandler(telegram_controller=telegram) if telegram else None
+        self._jitter_range_ms = (500, 1400)
 
     def _init_session(self) -> None:
         """Initialize Selenium session if not already done."""
         if self._session is None:
-            self._session = SeleniumSession(
-                browser_type=self._browser_type,
+            self._rotate_identity()
+            cfg = SeleniumSessionConfig(
                 headless=self._headless,
-                logger=self.logger
+                proxy=self._current_proxy,
+                user_agent=self._current_ua,
+            )
+            self._session = SeleniumSession(
+                config=cfg,
+                headless=self._headless,
+                logger=self.logger,
             )
             self._session.set_page_load_timeout(self._timeout)
+            self._session.set_script_timeout(self._timeout)
     
     def _wait_for_element(self, by: str, selector: str, timeout: int = None) -> WebElement:
         """Wait for an element to be present on the page."""
@@ -111,6 +125,7 @@ class QuoraAdapter(BasePlatformAdapter):
         """Perform the login process with email and password."""
         try:
             self._session.driver.get(self.LOGIN_URL)
+            self._human_pause()
             
             # Wait for login form
             email_field = self._wait_for_element(
@@ -140,7 +155,8 @@ class QuoraAdapter(BasePlatformAdapter):
             login_button.click()
             
             # Wait for login to complete
-            time.sleep(5)  # Wait for potential redirects
+            self._human_pause()
+            time.sleep(3)  # Wait for potential redirects
             
             # Check for login success
             if not self._is_logged_in():
@@ -162,6 +178,7 @@ class QuoraAdapter(BasePlatformAdapter):
         self._init_session()
         
         try:
+            self._human_pause()
             # Check if already logged in
             if self._is_logged_in():
                 self._logged_in_as = account.get('email')
@@ -180,7 +197,8 @@ class QuoraAdapter(BasePlatformAdapter):
             login_success = self._login_with_credentials(email, password)
             
             if not login_success:
-                raise AuthenticationError("Login failed. Check your credentials or solve CAPTCHA.")
+                shot = self._capture_screenshot_safe("quora_login_failed")
+                raise AuthenticationError(f"Login failed. Check your credentials or solve CAPTCHA. {shot or ''}")
             
             self._logged_in_as = email
             return AdapterResult(
@@ -195,6 +213,7 @@ class QuoraAdapter(BasePlatformAdapter):
                 "Quora login error", 
                 extra={"component": "quora_adapter", "error": str(exc)}
             )
+            shot = self._capture_screenshot_safe("quora_login_error")
             raise AuthenticationError(f"Login failed: {str(exc)}")
 
     def _scroll_to_bottom(self):
@@ -514,10 +533,38 @@ class QuoraAdapter(BasePlatformAdapter):
 
     def _scroll_to_bottom(self):
         """Scroll to the bottom of the page to load more content."""
-        self._session.driver.execute_script(
-            "window.scrollTo(0, document.body.scrollHeight);"
-        )
-        time.sleep(2)  # Wait for content to load
+        try:
+            self._session.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            self._human_pause()
+        except Exception as e:
+            self.logger.warning(f"Error scrolling: {e}")
+
+    def _human_pause(self):
+        time.sleep(random.uniform(self._jitter_range_ms[0] / 1000.0, self._jitter_range_ms[1] / 1000.0))
+        if self._session:
+            try:
+                self._session.human_pause()
+            except Exception:
+                pass
+
+    def _type_slow(self, element: WebElement, text: str) -> None:
+        """Simulate human typing with jittered pauses."""
+        for ch in text:
+            element.send_keys(ch)
+            time.sleep(random.uniform(0.02, 0.08))
+
+    def _rotate_identity(self) -> None:
+        self._current_ua = pick_random_user_agent(self._ua_pool) or "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+        self._current_proxy = random.choice(self._proxy_pool) if self._proxy_pool else None
+
+    def _capture_screenshot_safe(self, label: str) -> Optional[str]:
+        try:
+            if not self._session or not self._session.driver:
+                return None
+            target = f"{label}_{int(time.time())}.png"
+            return self._session.capture_screenshot(target)
+        except Exception:
+            return None
 
     def _get_question_links(self, topic_url: str, limit: int) -> List[Dict[str, str]]:
         """Extract question links from a topic page."""
@@ -632,6 +679,7 @@ class QuoraAdapter(BasePlatformAdapter):
             with self.rate_limiter:
                 # Navigate to the question page
                 self._session.driver.get(question_url)
+                start = time.monotonic()
                 
                 # Wait for answer box
                 answer_button = self._wait_for_element_clickable(
@@ -657,7 +705,7 @@ class QuoraAdapter(BasePlatformAdapter):
                     timeout=10
                 )
                 editor.clear()
-                editor.send_keys(content)
+                self._type_slow(editor, content)
                 
                 # Switch back to main content
                 self._session.driver.switch_to.default_content()
@@ -685,7 +733,8 @@ class QuoraAdapter(BasePlatformAdapter):
                     data={
                         'answer_id': answer_id,
                         'url': answer_url,
-                        'question_url': question_url
+                        'question_url': question_url,
+                        'duration_ms': round((time.monotonic() - start) * 1000, 2),
                     }
                 )
                 
@@ -694,9 +743,10 @@ class QuoraAdapter(BasePlatformAdapter):
                 "Failed to post answer", 
                 extra={"component": "quora_adapter", "error": str(exc), "question_url": question_url}
             )
+            shot = self._capture_screenshot_safe("quora_post_error")
             return AdapterResult(
                 success=False, 
-                data={"question_url": question_url}, 
+                data={"question_url": question_url, "screenshot": shot} if shot else {"question_url": question_url}, 
                 error=str(exc), 
                 retry_recommended=not isinstance(exc, (AuthenticationError, AntiBotChallengeError))
             )

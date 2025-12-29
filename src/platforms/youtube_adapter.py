@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
+import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -30,6 +32,7 @@ from src.platforms.base_adapter import (
 from src.utils.rate_limiter import FixedWindowRateLimiter
 from src.utils.retry import retry_with_exponential_backoff
 from src.platforms.captcha_handler import CaptchaHandler
+from src.utils.user_agents import pick_random_user_agent
 
 
 class YouTubeAdapter(BasePlatformAdapter):
@@ -42,10 +45,16 @@ class YouTubeAdapter(BasePlatformAdapter):
         self._logged_in_as = None
         self._service = None
         self.captcha_handler = CaptchaHandler(telegram) if telegram else None
+        self._jitter_range_ms = (400, 1200)
+        self._proxy_pool = getattr(getattr(config, "platforms", None), "youtube", {}).get("proxies", []) if hasattr(config, "platforms") else []
+        self._ua_pool = getattr(getattr(config, "platforms", None), "youtube", {}).get("user_agents", []) if hasattr(config, "platforms") else []
+        self._current_proxy: Optional[str] = None
+        self._current_ua: Optional[str] = None
 
     def _create_client(self, account: Dict[str, Any]) -> Any:
         """Create and return an authenticated YouTube client."""
         try:
+            self._rotate_identity()
             creds = Credentials(
                 token=account.get('access_token'),
                 refresh_token=account.get('refresh_token'),
@@ -91,6 +100,7 @@ class YouTubeAdapter(BasePlatformAdapter):
     def login(self, account: Dict[str, Any]) -> AdapterResult:
         """Authenticate with YouTube using OAuth 2.0 credentials."""
         try:
+            self._human_pause()
             self._service = self._create_client(account)
             channels = self._call_with_limits(
                 self._service.channels().list,
@@ -153,8 +163,10 @@ class YouTubeAdapter(BasePlatformAdapter):
         try:
             if not self._service:
                 raise AuthenticationError("Not authenticated with YouTube")
+            self._human_pause()
                 
             # First, get the uploads playlist ID for the channel
+            start = time.monotonic()
             channels_response = self._call_with_limits(
                 self._service.channels().list,
                 part='contentDetails',
@@ -198,7 +210,7 @@ class YouTubeAdapter(BasePlatformAdapter):
                     'items': videos,
                     'channel_id': channel_id,
                     'limit': limit,
-                    'count': len(videos)
+                    'duration_ms': round((time.monotonic() - start) * 1000, 2),
                 }
             )
             
@@ -214,54 +226,61 @@ class YouTubeAdapter(BasePlatformAdapter):
                 retry_recommended=True
             )
 
-    def post_comment(self, video_id: str, content: str, account: Dict[str, Any]) -> AdapterResult:
+    def post_comment(self, video_id: str, content: str) -> AdapterResult:
         """Post a comment to a YouTube video."""
         try:
             if not self._service:
                 raise AuthenticationError("Not authenticated with YouTube")
-                
-            # First, check if we need to log in with a different account
-            if account.get('username') != self._logged_in_as:
-                login_result = self.login(account)
-                if not login_result.success:
-                    return login_result
+            self._human_pause()
             
-            # Post the comment
-            comment_response = self._call_with_limits(
-                self._service.commentThreads().insert,
-                part='snippet',
-                body={
-                    'snippet': {
-                        'videoId': video_id,
-                        'topLevelComment': {
-                            'snippet': {
-                                'textOriginal': content
-                            }
+            if not video_id:
+                raise ValueError("video_id is required")
+            
+            if not content or not content.strip():
+                raise ValueError("content is empty")
+            
+            comment_body = {
+                'snippet': {
+                    'videoId': video_id,
+                    'topLevelComment': {
+                        'snippet': {
+                            'textOriginal': content
                         }
                     }
                 }
+            }
+            
+            start = time.monotonic()
+            response = self._call_with_limits(
+                self._service.commentThreads().insert,
+                part='snippet',
+                body=comment_body
             )
+            
+            comment_id = response['id']
+            comment_url = f"https://www.youtube.com/watch?v={video_id}&lc={comment_id}"
             
             return AdapterResult(
                 success=True,
                 data={
-                    'comment_id': comment_response['id'],
-                    'video_id': video_id,
-                    'url': f"https://www.youtube.com/watch?v={video_id}&lc={comment_response['id']}"
+                    'comment_id': comment_id,
+                    'comment_url': comment_url,
+                    'duration_ms': round((time.monotonic() - start) * 1000, 2),
                 }
             )
             
         except Exception as exc:
             self.logger.error(
-                "Failed to post comment", 
-                extra={"component": "youtube_adapter", "error": str(exc), "video_id": video_id}
+                "YouTube post_comment error",
+                extra={"component": "youtube_adapter", "video_id": video_id, "error": str(exc)}
             )
-            return AdapterResult(
-                success=False, 
-                data={"video_id": video_id}, 
-                error=str(exc), 
-                retry_recommended=not isinstance(exc, AuthenticationError)
-            )
+            shot = None
+            try:
+                # No selenium session exists here; placeholder for future browser-based fallback
+                shot = None
+            except Exception:
+                shot = None
+            return AdapterResult(success=False, data={'video_id': video_id, "screenshot": shot} if shot else {'video_id': video_id}, error=str(exc), retry_recommended=True)
 
     def get_comment_metrics(self, comment_id: str) -> AdapterResult:
         """Get metrics for a specific comment."""
@@ -324,7 +343,55 @@ class YouTubeAdapter(BasePlatformAdapter):
 
     def check_account_health(self, account: Dict[str, Any]) -> AdapterResult:
         try:
-            return AdapterResult(success=True, data={"health_score": 0.5, "issues": ["not_implemented"]})
+            if not self._service:
+                raise AuthenticationError("Not authenticated with YouTube")
+
+            # Fetch channel stats
+            start = time.monotonic()
+            stats = self._call_with_limits(
+                self._service.channels().list,
+                part="statistics,snippet",
+                mine=True,
+                maxResults=1,
+            )
+            duration_ms = round((time.monotonic() - start) * 1000, 2)
+            if not stats.get("items"):
+                return AdapterResult(
+                    success=False,
+                    data={"issues": ["channel_not_found"], "duration_ms": duration_ms},
+                    error="No channel stats available",
+                    retry_recommended=False,
+                )
+
+            item = stats["items"][0]
+            statistics = item.get("statistics", {})
+            subs = int(statistics.get("subscriberCount", 0))
+            views = int(statistics.get("viewCount", 0))
+            videos = int(statistics.get("videoCount", 0))
+            issues: List[str] = []
+            health_score = 0.4
+            if subs >= 100:
+                health_score += 0.2
+            if views >= 10000:
+                health_score += 0.2
+            if videos >= 10:
+                health_score += 0.1
+            if subs < 10:
+                issues.append("low_subscribers")
+            if videos < 3:
+                issues.append("low_video_count")
+
+            return AdapterResult(
+                success=True,
+                data={
+                    "health_score": max(0.0, min(1.0, health_score)),
+                    "issues": issues,
+                    "subscribers": subs,
+                    "views": views,
+                    "videos": videos,
+                    "duration_ms": duration_ms,
+                },
+            )
         except Exception as exc:
             self.logger.error(
                 "YouTube adapter error", 

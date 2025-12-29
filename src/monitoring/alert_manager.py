@@ -83,6 +83,7 @@ class AlertManager:
             f"{icon} *{message}*",
             f"*Severity*: {severity}",
             f"*Type*: {alert_type}",
+            f"*At*: {now.isoformat()}",
         ]
         for k, v in (details or {}).items():
             lines.append(f"- *{k}*: `{v}`")

@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import random
 import re
 import time
 from datetime import datetime, timedelta
@@ -26,6 +27,8 @@ from src.platforms.base_adapter import (
 from src.platforms.captcha_handler import CaptchaHandler
 from src.utils.crypto import credential_manager
 from src.utils.rate_limiter import FixedWindowRateLimiter
+from src.platforms.selenium_session import SeleniumSession, SeleniumSessionConfig
+from src.utils.user_agents import pick_random_user_agent
 from src.utils.retry import retry_with_exponential_backoff
 
 
@@ -41,6 +44,14 @@ class RedditAdapter(BasePlatformAdapter):
         self._current_account_id: Optional[int] = None
         self._last_health_check: Dict[int, float] = {}  # account_id -> timestamp
         self.captcha_handler = CaptchaHandler(telegram) if telegram else None
+        self._selenium: Optional[SeleniumSession] = None
+        self._proxy_pool: List[str] = config.platforms.reddit.get("proxies", []) if hasattr(config, "platforms") and hasattr(config.platforms, "reddit") else []
+        self._ua_pool: List[str] = config.platforms.reddit.get("user_agents", []) if hasattr(config, "platforms") and hasattr(config.platforms, "reddit") else []
+        self._current_proxy: Optional[str] = None
+        self._current_ua: Optional[str] = None
+        self._ops_timing: Dict[str, float] = {}
+        self._jitter_range_ms = (400, 1200)
+        self._max_timeout_seconds = getattr(getattr(config, "retry", None), "timeout_seconds", 30)
 
     def _load_account_from_db(self, account_id: int) -> Optional[Dict[str, Any]]:
         """Load and decrypt account credentials from database."""
@@ -133,6 +144,7 @@ class RedditAdapter(BasePlatformAdapter):
             
             # Store account ID for health updates
             self._current_account_id = account.get('id')
+            self._human_jitter()
             
             # Create and test client
             try:
@@ -173,29 +185,35 @@ class RedditAdapter(BasePlatformAdapter):
         except AuthenticationError as exc:
             if self._current_account_id:
                 self._update_account_health(self._current_account_id, False, str(exc))
+            shot = self._capture_screenshot_safe("login_error")
             return AdapterResult(
                 success=False, 
                 error=str(exc), 
-                retry_recommended=False
+                retry_recommended=False,
+                data={"screenshot": shot} if shot else {},
             )
             
         except (RateLimitError, PlatformAdapterError) as exc:
             if self._current_account_id:
                 self._update_account_health(self._current_account_id, False, str(exc))
+            shot = self._capture_screenshot_safe("login_ratelimit")
             return AdapterResult(
                 success=False, 
                 error=str(exc), 
-                retry_recommended=True
+                retry_recommended=True,
+                data={"screenshot": shot} if shot else {},
             )
             
         except Exception as exc:
             if self._current_account_id:
                 self._update_account_health(self._current_account_id, False, str(exc))
             self.logger.error(f"Unexpected error in Reddit login: {str(exc)}", exc_info=True)
+            shot = self._capture_screenshot_safe("login_unexpected")
             return AdapterResult(
                 success=False, 
                 error=f"Unexpected error: {str(exc)}", 
-                retry_recommended=True
+                retry_recommended=True,
+                data={"screenshot": shot} if shot else {},
             )
 
     def find_target_posts(self, location: str, limit: int = 10, min_score: int = 10, min_comments: int = 5, account: Optional[Union[Dict[str, Any], int]] = None) -> AdapterResult:
@@ -217,6 +235,7 @@ class RedditAdapter(BasePlatformAdapter):
                 login_result = self.login(account)
                 if not login_result.success:
                     return login_result
+            self._human_jitter()
             
             subreddit_name = self._normalize_subreddit(location)
             
@@ -227,6 +246,7 @@ class RedditAdapter(BasePlatformAdapter):
                     # Get more posts than requested to filter by score/comments
                     fetch_limit = max(limit * 3, 50)
                     for submission in sub.hot(limit=fetch_limit):
+                        self._human_scroll()
                         try:
                             score = getattr(submission, "score", 0)
                             num_comments = getattr(submission, "num_comments", 0)
@@ -260,7 +280,9 @@ class RedditAdapter(BasePlatformAdapter):
                             
                     return items
 
+                start = time.monotonic()
                 posts = self._call_with_limits(_op)
+                self._log_duration("find_target_posts", start)
                 
                 # Update account health on success
                 if self._current_account_id:
@@ -271,13 +293,15 @@ class RedditAdapter(BasePlatformAdapter):
                     data={
                         "items": posts, 
                         "subreddit": subreddit_name,
-                        "account_id": self._current_account_id
+                        "account_id": self._current_account_id,
+                        "duration_ms": round((time.monotonic() - start) * 1000, 2),
                     }
                 )
                 
             except Exception as e:
                 error_msg = f"Error finding posts in r/{subreddit_name}: {str(e)}"
                 self.logger.error(error_msg, exc_info=True)
+                shot = self._capture_screenshot_safe("find_posts_error")
                 
                 # Update account health on failure
                 if self._current_account_id:
@@ -286,7 +310,8 @@ class RedditAdapter(BasePlatformAdapter):
                 return AdapterResult(
                     success=False, 
                     error=error_msg, 
-                    retry_recommended=not isinstance(e, AuthenticationError)
+                    retry_recommended=not isinstance(e, AuthenticationError),
+                    data={"screenshot": shot} if shot else {},
                 )
                 
         except Exception as exc:
@@ -316,6 +341,7 @@ class RedditAdapter(BasePlatformAdapter):
                 login_result = self.login(account)
                 if not login_result.success:
                     return login_result
+            self._human_jitter()
             
             if not target_id:
                 raise ValueError("target_id is required")
@@ -341,7 +367,9 @@ class RedditAdapter(BasePlatformAdapter):
                                     "duplicate": True
                                 }
                     
-                    # Post the comment
+                    # Post the comment with a human-like pause
+                    self._human_jitter()
+                    self._human_scroll()
                     comment = submission.reply(content)
                     return {
                         "comment_id": getattr(comment, "id", None), 
@@ -349,7 +377,9 @@ class RedditAdapter(BasePlatformAdapter):
                         "duplicate": False
                     }
                 
+                start = time.monotonic()
                 res = self._call_with_limits(_op)
+                self._log_duration("post_comment", start)
                 
                 # Update account health on success
                 if self._current_account_id:
@@ -360,7 +390,8 @@ class RedditAdapter(BasePlatformAdapter):
                     data={
                         **res,
                         "account_id": self._current_account_id,
-                        "username": self._logged_in_as
+                        "username": self._logged_in_as,
+                        "duration_ms": round((time.monotonic() - start) * 1000, 2),
                     }
                 )
                 
@@ -374,11 +405,17 @@ class RedditAdapter(BasePlatformAdapter):
                 
                 # If we got rate limited, signal retry/rotate to caller
                 if "RATELIMIT" in str(e).upper():
+                    shot = self._capture_screenshot_safe("ratelimit")
                     return AdapterResult(
                         success=False,
                         error=error_msg,
                         retry_recommended=True,
-                        data={"rotate_account": True, "account_id": self._current_account_id},
+                        data={
+                            "rotate_account": True,
+                            "account_id": self._current_account_id,
+                            "screenshot": shot,
+                            "duration_ms": round((time.monotonic() - start) * 1000, 2),
+                        },
                     )
                 
                 return AdapterResult(
@@ -498,20 +535,13 @@ class RedditAdapter(BasePlatformAdapter):
                 results["reasons"].append("AutoModerator indicates shadowban")
             elif "not shadowbanned" in response_text:
                 method_conf = 0.05
-            if method_conf:
-                confidences.append(method_conf)
-            results["methods_used"]["shadowban_post"] = {"confidence": method_conf}
-            # Clean up
-            try:
-                submission.delete()
-            except Exception:
-                pass
+            self._human_jitter()
+            self._human_scroll()
         except Exception as exc:
             self.logger.warning("Shadowban test post failed", extra={"error": str(exc)})
             results["methods_used"]["shadowban_post"] = {"error": str(exc), "confidence": 0.0}
 
         # Method B: last 5 comments visibility
-        try:
             user = self._client.user.me()
             comments = list(user.comments.new(limit=5))
             visible = 0
@@ -607,7 +637,7 @@ class RedditAdapter(BasePlatformAdapter):
 
         client_id = oauth_cfg.get("client_id")
         client_secret = oauth_cfg.get("client_secret")
-        user_agent = oauth_cfg.get("user_agent")
+        user_agent_cfg = oauth_cfg.get("user_agent")
         username = oauth_cfg.get("username")
         password = oauth_cfg.get("password")
         if not all([client_id, client_secret, user_agent, username, password]):
@@ -616,13 +646,63 @@ class RedditAdapter(BasePlatformAdapter):
         if otp:
             password = f"{password}:{otp}"
 
+        self._rotate_identity(preferred_ua=user_agent_cfg)
+
+        requestor_kwargs = {}
+        if self._current_proxy:
+            requestor_kwargs = {
+                "proxies": {
+                    "http": self._current_proxy,
+                    "https": self._current_proxy,
+                }
+            }
+            self.logger.info("Using proxy for Reddit client", extra={"proxy": self._current_proxy})
+
+        self.logger.info(
+            "Using user agent for Reddit client",
+            extra={"ua": self._current_ua},
+        )
+
         return praw.Reddit(
             client_id=client_id,
             client_secret=client_secret,
-            user_agent=user_agent,
+            user_agent=self._current_ua,
             username=username,
             password=password,
+            requestor_kwargs=requestor_kwargs or None,
         )
+
+    def _rotate_identity(self, preferred_ua: Optional[str] = None) -> None:
+        """Rotate user-agent/proxy for this session."""
+        self._current_ua = preferred_ua or pick_random_user_agent(self._ua_pool) or "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+        self._current_proxy = random.choice(self._proxy_pool) if self._proxy_pool else None
+
+    def _ensure_selenium(self) -> None:
+        """Lazily create Selenium session for screenshots/anti-bot diagnostics."""
+        if self._selenium:
+            return
+        cfg = SeleniumSessionConfig(
+            headless=True,
+            proxy=self._current_proxy,
+            user_agent=self._current_ua,
+        )
+        self._selenium = SeleniumSession(config=cfg, logger=self.logger.getChild("selenium"))
+        try:
+            self._selenium.start()
+            self._selenium.human_pause(600, 1400)
+        except Exception:
+            self._selenium = None
+
+    def _capture_screenshot_safe(self, label: str) -> Optional[str]:
+        """Capture screenshot if Selenium session is available/initializable."""
+        try:
+            self._ensure_selenium()
+            if not self._selenium or not self._selenium.driver:
+                return None
+            target = f"{label}_{int(time.time())}.png"
+            return self._selenium.capture_screenshot(target)
+        except Exception:
+            return None
 
     @retry_with_exponential_backoff(max_attempts=3, base_delay=1.0, max_delay=15.0)
     def _call_with_limits(self, func):

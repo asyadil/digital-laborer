@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+import random
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -88,7 +89,8 @@ class SeleniumSession:
         profile_dir: Optional[str] = None,
         proxy: Optional[str] = None,
         user_agent: Optional[str] = None,
-        logger: Optional[logging.Logger] = None
+        logger: Optional[logging.Logger] = None,
+        browser_type: Optional[str] = None,  # kept for compatibility, currently Chrome only
     ) -> None:
         """Initialize the Selenium session manager.
         
@@ -117,6 +119,7 @@ class SeleniumSession:
         
         self.driver: Optional[WebDriver] = None
         self._is_running = False
+        self._browser_type = browser_type or "chrome"
     
     def __enter__(self):
         self.start()
@@ -155,6 +158,32 @@ class SeleniumSession:
             self.logger.error(f"Failed to start WebDriver: {str(e)}", exc_info=True)
             self.stop()
             raise
+    
+    def set_page_load_timeout(self, seconds: int) -> None:
+        if self.driver:
+            self.driver.set_page_load_timeout(seconds)
+
+    def set_script_timeout(self, seconds: int) -> None:
+        if self.driver:
+            self.driver.set_script_timeout(seconds)
+
+    def human_pause(self, min_ms: int = 400, max_ms: int = 1200) -> None:
+        """Inject human-like jittered pauses to avoid bot-like timing."""
+        sleep_for = random.uniform(min_ms, max_ms) / 1000.0
+        time.sleep(sleep_for)
+
+    def capture_screenshot(self, path: Optional[str] = None) -> Optional[str]:
+        """Capture screenshot if driver is available."""
+        if not self.driver:
+            return None
+        target = path or str(Path(self.config.user_data_dir) / f"shot_{int(time.time())}.png")
+        try:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            self.driver.save_screenshot(target)
+            return target
+        except Exception as exc:
+            self.logger.warning("Failed to capture screenshot", extra={"error": str(exc), "path": target})
+            return None
     
     def _get_chrome_options(self) -> uc.ChromeOptions:
         """Configure Chrome options based on the current configuration."""

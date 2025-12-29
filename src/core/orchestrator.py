@@ -111,17 +111,28 @@ class SystemOrchestrator:
 
     async def main_loop(self) -> None:
         """Primary event loop for periodic persistence and health checks."""
-        try:
-            while not self._stop_event.is_set():
-                # Persist state every 60 seconds.
+        while not self._stop_event.is_set():
+            try:
+                start = datetime.utcnow()
                 self._persist_state()
                 await asyncio.wait_for(self._stop_event.wait(), timeout=60.0)
-        except asyncio.TimeoutError:
-            return await self.main_loop()
-        except asyncio.CancelledError:
-            return
-        except Exception as exc:
-            self.logger.error("Main loop error", extra={"component": "orchestrator", "error": str(exc)})
+            except asyncio.TimeoutError:
+                # expected to wake up and loop again
+                continue
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                self.logger.error(
+                    "Main loop error",
+                    extra={"component": "orchestrator", "error": str(exc)},
+                )
+                await asyncio.sleep(1.0)
+            finally:
+                elapsed = (datetime.utcnow() - start).total_seconds()
+                self.logger.debug(
+                    "Main loop tick",
+                    extra={"component": "orchestrator", "elapsed_sec": round(elapsed, 3)},
+                )
 
     def _register_signal_handlers(self) -> None:
         loop = asyncio.get_running_loop()
@@ -458,10 +469,21 @@ class SystemOrchestrator:
                 "Failed to load synonyms",
                 extra={"component": "orchestrator", "path": synonyms_path, "error": str(exc)},
             )
+        referral_path = os.getenv("REFERRAL_LINKS_PATH", os.path.join("config", "referral_links.yaml"))
+        referral_links = {}
+        try:
+            referral_links = self.config_manager.load_referral_links(referral_path)
+        except Exception as exc:
+            self.logger.error(
+                "Failed to load referral links",
+                extra={"component": "orchestrator", "path": referral_path, "error": str(exc)},
+            )
+
         self.content_generator = ContentGenerator(
             config=self.config_manager.config,
             templates=self.template_manager,
             synonyms=synonyms,
+            referral_links=referral_links.get("referral_links", []),
         )
 
     def _init_platform_adapters(self) -> None:
@@ -558,10 +580,11 @@ class SystemOrchestrator:
                 content=post_data.get("content", ""),
                 url=None,
                 posted_at=None,
-                status=PostStatus.pending,
+                status=PostStatus.PENDING,
                 clicks=0,
                 conversions=0,
                 quality_score=score,
+                quality_breakdown=quality.get("breakdown"),
                 human_approved=False,
                 metadata_json={
                     "template_id": template_id,

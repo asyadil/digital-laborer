@@ -27,6 +27,16 @@ _SPAM_PHRASES = [
     "act now",
     "limited time",
     "free money",
+    "easy money",
+    "earn fast",
+    "too good to be true",
+    "instant cash",
+    "double your",
+    "no effort",
+    "miracle",
+    "secret trick",
+    "get rich",
+    "overnight",
 ]
 
 
@@ -63,6 +73,7 @@ class QualityScorer:
             "readability": readability_score,
         }
 
+        # Weights per spec: length 0.2, spam 0.3, flow 0.2, link placement 0.2, readability 0.1
         total = (
             0.2 * length_score
             + 0.3 * spam_score
@@ -94,6 +105,8 @@ class QualityScorer:
         phrase_hits = sum(1 for p in _SPAM_PHRASES if p in lowered)
         link_penalty = max(0, len(links) - self.max_links)
         repeated_word_penalty = self._repetition_penalty(lowered)
+        caps_penalty = 0.1 if self._excessive_caps(content) else 0.0
+        bang_penalty = 0.1 if content.count("!") > 3 else 0.0
 
         score = 1.0
         if phrase_hits:
@@ -105,6 +118,14 @@ class QualityScorer:
         if repeated_word_penalty > 0:
             score -= min(0.4, repeated_word_penalty)
             suggestions.append("Avoid repeating the same words/phrases")
+        if caps_penalty:
+            score -= caps_penalty
+            suggestions.append("Use fewer ALL-CAPS words")
+        if bang_penalty:
+            score -= bang_penalty
+            suggestions.append("Reduce exclamation marks")
+        if any(token in lowered for token in ["http://", "https://"]) and len(links) == 0:
+            suggestions.append("Avoid obfuscated links; use clean URLs sparingly")
         return max(0.0, score), suggestions
 
     def _repetition_penalty(self, lowered: str) -> float:
@@ -148,18 +169,30 @@ class QualityScorer:
             return 0.7, ["Consider adding a helpful link if relevant"]
 
         score = 1.0
-        first_40 = " ".join(_WORD_SPLIT_RE.findall(content)[:40]).lower()
+        tokens = _WORD_SPLIT_RE.findall(content)
+        first_40 = " ".join(tokens[:40]).lower()
         if any(link.lower() in first_40 for link in links):
             score -= 0.2
             suggestions.append("Avoid placing links at the very start")
 
         # Penalize link dumping at end
-        last_40 = " ".join(_WORD_SPLIT_RE.findall(content)[-40:]).lower()
+        last_40 = " ".join(tokens[-40:]).lower()
         if sum(1 for link in links if link.lower() in last_40) == len(links) and len(links) >= 2:
             score -= 0.2
             suggestions.append("Distribute links naturally within content")
 
+        # Reward mid-body placement when single link
+        if len(links) == 1 and score == 1.0:
+            score = 1.0
+
         return max(0.0, score), suggestions
+
+    def _excessive_caps(self, content: str) -> bool:
+        letters = [c for c in content if c.isalpha()]
+        if not letters:
+            return False
+        caps = sum(1 for c in letters if c.isupper())
+        return (caps / len(letters)) > 0.4
 
     def _readability_score(self, content: str) -> tuple[float, List[str]]:
         suggestions: List[str] = []

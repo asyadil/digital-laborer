@@ -235,6 +235,28 @@ class ConfigManager:
                 raise ValueError("Top-level configuration must be a mapping")
             return data
 
+    def load_platforms_config(self, path: str) -> Dict[str, Any]:
+        """Load platforms.yaml for adapters (optional helper)."""
+        if not os.path.exists(path):
+            self.logger.warning("Platforms config not found", extra={"component": "config", "path": path})
+            return {}
+        with open(path, "r", encoding="utf-8") as stream:
+            data = yaml.safe_load(stream) or {}
+            if not isinstance(data, dict):
+                raise ValueError("platforms config must be a mapping")
+            return _resolve_env_vars(data)
+
+    def load_referral_links(self, path: str) -> Dict[str, Any]:
+        """Load referral_links.yaml for content insertion."""
+        if not os.path.exists(path):
+            self.logger.warning("Referral links config not found", extra={"component": "config", "path": path})
+            return {}
+        with open(path, "r", encoding="utf-8") as stream:
+            data = yaml.safe_load(stream) or {}
+            if not isinstance(data, dict):
+                raise ValueError("referral_links config must be a mapping")
+            return _resolve_env_vars(data)
+
     @property
     def last_loaded_at(self) -> Optional[datetime]:
         return self._last_loaded_at
