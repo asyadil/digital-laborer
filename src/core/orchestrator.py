@@ -201,7 +201,7 @@ class SystemOrchestrator:
             self.logger.info(f"Posting content to {platform} (post_id={post_id})...")
             
             target_post = None
-            account = None
+            account_creds: Optional[Dict[str, Any]] = None
             if platform == "reddit":
                 subreddit = post.metadata_json.get("subreddit") if post.metadata_json else None
                 if not subreddit:
@@ -214,16 +214,23 @@ class SystemOrchestrator:
                         session.add(post)
                     return False
 
+                if self.account_manager:
+                    acct = self.account_manager.get_best_account("reddit")
+                    if not acct:
+                        acct = self.account_manager.rotate_accounts("reddit")
+                    if acct:
+                        account_creds = self.account_manager.get_account_credentials(acct)
+
                 find_result = adapter.find_target_posts(
                     location=subreddit,
                     limit=5,
                     min_score=10,
-                    min_comments=3,
+                    min_comments=2,
+                    account=account_creds,
                 )
-
                 if not find_result.success or not find_result.data.get("items"):
-                    error_msg = f"Failed to find target posts in r/{subreddit}: {find_result.error}"
-                    self.logger.error(error_msg)
+                    error_msg = "No suitable target posts found"
+                    self.logger.warning(error_msg)
                     with self.db.session_scope() as session:
                         post = session.merge(post)
                         post.status = PostStatus.FAILED
@@ -232,18 +239,12 @@ class SystemOrchestrator:
                     return False
 
                 target_post = find_result.data["items"][0]
-                if self.account_manager:
-                    acct = self.account_manager.get_best_account("reddit")
-                    if not acct:
-                        acct = self.account_manager.rotate_accounts("reddit")
-                    if acct:
-                        account = self.account_manager.get_account_credentials(acct)
 
             # Post the content
             post_result = await adapter.post_comment(
                 target_id=target_post["id"] if target_post else None,
                 content=post.content,
-                account=account,
+                account=account_creds,
             )
             
             # Handle the result

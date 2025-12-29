@@ -65,41 +65,9 @@ class RedditAdapter(BasePlatformAdapter):
         }
 
     def _get_best_account(self) -> Optional[Dict[str, Any]]:
-        """Get the healthiest, least-recently-used active account."""
-        if not self.db_session:
-            self.logger.error("Database session not provided")
-            return None
-
-        now = datetime.utcnow()
-        cooldown = timedelta(minutes=1)
-        accounts = (
-            self.db_session.query(Account)
-            .filter(Account.platform == "reddit", Account.status == AccountStatus.active)
-            .order_by(Account.health_score.desc(), Account.last_used.asc().nullsfirst())
-            .all()
-        )
-        if not accounts:
-            return None
-
-        for account in accounts:
-            last_used = account.last_used or datetime.min.replace(tzinfo=None)
-            if (now - last_used) > cooldown:
-                return {
-                    "id": account.id,
-                    "username": account.username,
-                    "password": credential_manager.decrypt(account.password_encrypted),
-                    "health_score": account.health_score,
-                    "metadata": account.metadata_json or {},
-                }
-
-        account = accounts[0]
-        return {
-            "id": account.id,
-            "username": account.username,
-            "password": credential_manager.decrypt(account.password_encrypted),
-            "health_score": account.health_score,
-            "metadata": account.metadata_json or {},
-        }
+        """Deprecated: use AccountManager for account selection."""
+        self.logger.warning("Deprecated _get_best_account called; delegate to AccountManager in orchestrator.")
+        return None
 
     def _update_account_health(self, account_id: int, success: bool, error: str = None):
         """Update account health based on operation result."""
@@ -155,24 +123,11 @@ class RedditAdapter(BasePlatformAdapter):
                         retry_recommended=False
                     )
             
-            # If no account provided, try to find the best available
-            if not account and self.db_session:
-                account = self._get_best_account()
-                if not account:
-                    return AdapterResult(
-                        success=False,
-                        error="No healthy Reddit accounts available",
-                        retry_recommended=False
-                    )
-            
-            # If we still don't have an account, use the first credential
-            if not account and self.credentials:
-                account = self.credentials[0]
-            
+            # Adapter no longer auto-picks accounts; orchestrator must supply one
             if not account:
                 return AdapterResult(
                     success=False,
-                    error="No Reddit accounts available",
+                    error="No Reddit account supplied",
                     retry_recommended=False
                 )
             
@@ -243,7 +198,7 @@ class RedditAdapter(BasePlatformAdapter):
                 retry_recommended=True
             )
 
-    def find_target_posts(self, location: str, limit: int = 10, min_score: int = 10, min_comments: int = 5) -> AdapterResult:
+    def find_target_posts(self, location: str, limit: int = 10, min_score: int = 10, min_comments: int = 5, account: Optional[Union[Dict[str, Any], int]] = None) -> AdapterResult:
         """
         Find target posts in a subreddit (location=subreddit).
         
@@ -257,9 +212,9 @@ class RedditAdapter(BasePlatformAdapter):
             AdapterResult with list of posts and metadata
         """
         try:
-            # Ensure we're logged in
+            # Ensure we're logged in with supplied account
             if self._client is None:
-                login_result = self.login(None)  # Try to login with best available account
+                login_result = self.login(account)
                 if not login_result.success:
                     return login_result
             
@@ -356,7 +311,7 @@ class RedditAdapter(BasePlatformAdapter):
             AdapterResult with comment details on success
         """
         try:
-            # Ensure we have a valid client
+            # Ensure we have a valid client with supplied account
             if self._client is None or (account and isinstance(account, int) and account != self._current_account_id):
                 login_result = self.login(account)
                 if not login_result.success:
@@ -417,10 +372,14 @@ class RedditAdapter(BasePlatformAdapter):
                 if self._current_account_id:
                     self._update_account_health(self._current_account_id, False, error_msg)
                 
-                # If we got rate limited, try with a different account
-                if "RATELIMIT" in str(e).upper() and self.db_session:
-                    self.logger.warning("Rate limited, trying with a different account...")
-                    return self.post_comment(target_id, content, None)  # Let it pick a new account
+                # If we got rate limited, signal retry/rotate to caller
+                if "RATELIMIT" in str(e).upper():
+                    return AdapterResult(
+                        success=False,
+                        error=error_msg,
+                        retry_recommended=True,
+                        data={"rotate_account": True, "account_id": self._current_account_id},
+                    )
                 
                 return AdapterResult(
                     success=False, 

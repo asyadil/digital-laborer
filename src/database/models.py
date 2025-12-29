@@ -76,6 +76,9 @@ class Account(Base, TimestampMixin):
     posts: Mapped[list[Post]] = relationship(
         "Post", back_populates="account", cascade="all, delete-orphan", passive_deletes=True
     )
+    health_events: Mapped[list["AccountHealth"]] = relationship(
+        "AccountHealth", back_populates="account", cascade="all, delete-orphan", passive_deletes=True
+    )
 
     __table_args__ = (Index("ix_accounts_platform_status", "platform", "status"),)
 
@@ -102,6 +105,21 @@ class Post(Base, TimestampMixin):
         Index("ix_posts_platform_status", "platform", "status"),
         Index("ix_posts_account", "account_id", "posted_at"),
     )
+
+
+class AccountHealth(Base):
+    __tablename__ = "account_health"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False)
+    health_score: Mapped[float] = mapped_column(Float, nullable=False)
+    success: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    error: Mapped[Optional[str]] = mapped_column(Text)
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=func.now(), index=True)
+
+    account: Mapped["Account"] = relationship("Account", back_populates="health_events")
+
+    __table_args__ = (Index("ix_account_health_account_time", "account_id", "timestamp"),)
 
 
 class ReferralLink(Base, TimestampMixin):
