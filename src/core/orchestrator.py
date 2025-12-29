@@ -236,7 +236,8 @@ class SystemOrchestrator:
                     acct = self.account_manager.get_best_account("reddit")
                     if not acct:
                         acct = self.account_manager.rotate_accounts("reddit")
-                    account = acct.id if acct else None
+                    if acct:
+                        account = self.account_manager.get_account_credentials(acct)
 
             # Post the content
             post_result = await adapter.post_comment(

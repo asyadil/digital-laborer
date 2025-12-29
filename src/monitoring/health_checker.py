@@ -179,19 +179,17 @@ class HealthChecker:
         details: Dict[str, Any] = {}
         try:
             with self.db.session_scope() as session:
-                accounts = (
-                    session.query(Account)
-                    .filter(Account.status == AccountStatus.active)
-                    .all()
-                )
-                if not accounts:
+                active_accounts = session.query(Account).filter(Account.status == AccountStatus.active).all()
+                flagged_accounts = session.query(Account).filter(Account.status == AccountStatus.flagged).all()
+                if not active_accounts:
                     status = "degraded"
                     score = 0.6
                     details["note"] = "No active accounts"
                 else:
-                    avg_health = sum(a.health_score or 0.0 for a in accounts) / max(1, len(accounts))
+                    avg_health = sum(a.health_score or 0.0 for a in active_accounts) / max(1, len(active_accounts))
                     details["average_health"] = avg_health
-                    details["active_accounts"] = len(accounts)
+                    details["active_accounts"] = len(active_accounts)
+                    details["flagged_accounts"] = len(flagged_accounts)
                     if avg_health < 0.6:
                         status = "degraded"
                         score = 0.6
