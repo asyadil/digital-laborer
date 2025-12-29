@@ -307,6 +307,7 @@ class RedditAdapter(BasePlatformAdapter):
                 error_msg = f"Error finding posts in r/{subreddit_name}: {str(e)}"
                 self.logger.error(error_msg, exc_info=True)
                 shot = self._capture_screenshot_safe("find_posts_error")
+                code, backoff = self._categorize_error(e)
                 
                 # Update account health on failure
                 if self._current_account_id:
@@ -316,7 +317,7 @@ class RedditAdapter(BasePlatformAdapter):
                     success=False, 
                     error=error_msg, 
                     retry_recommended=not isinstance(e, AuthenticationError),
-                    data={"screenshot": shot} if shot else {},
+                    data={"screenshot": shot, "error_code": code, "backoff_seconds": backoff} if shot else {"error_code": code, "backoff_seconds": backoff},
                 )
                 
         except Exception as exc:
@@ -403,6 +404,7 @@ class RedditAdapter(BasePlatformAdapter):
             except Exception as e:
                 error_msg = f"Error posting comment: {str(e)}"
                 self.logger.error(error_msg, exc_info=True)
+                code, backoff = self._categorize_error(e)
                 
                 # Update account health on failure
                 if self._current_account_id:
@@ -420,13 +422,16 @@ class RedditAdapter(BasePlatformAdapter):
                             "account_id": self._current_account_id,
                             "screenshot": shot,
                             "duration_ms": round((time.monotonic() - start) * 1000, 2),
+                            "error_code": code,
+                            "backoff_seconds": backoff,
                         },
                     )
                 
                 return AdapterResult(
                     success=False, 
                     error=error_msg, 
-                    retry_recommended=not isinstance(e, AuthenticationError)
+                    retry_recommended=not isinstance(e, AuthenticationError),
+                    data={"error_code": code, "backoff_seconds": backoff},
                 )
                 
         except Exception as exc:
@@ -731,6 +736,18 @@ class RedditAdapter(BasePlatformAdapter):
             self.logger.debug("Adapter timing", extra={"component": "reddit_adapter", "operation": name, "duration_ms": elapsed})
         except Exception:
             pass
+
+    def _categorize_error(self, error: Exception) -> tuple[str, Optional[int]]:
+        txt = str(error).lower()
+        if "ratelimit" in txt or "too many requests" in txt or "429" in txt:
+            return "rate_limit", 60
+        if "forbidden" in txt or "403" in txt:
+            return "forbidden", None
+        if "ban" in txt or "shadowban" in txt:
+            return "ban_suspected", None
+        if isinstance(error, AuthenticationError):
+            return "auth", None
+        return "unknown", None
 
     @retry_with_exponential_backoff(max_attempts=3, base_delay=1.0, max_delay=15.0)
     def _call_with_limits(self, func):

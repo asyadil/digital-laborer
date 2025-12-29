@@ -618,6 +618,7 @@ class QuoraAdapter(BasePlatformAdapter):
             # Scroll to load more questions
             try:
                 self._scroll_to_bottom()
+                self._human_pause()
             except Exception as e:
                 self.logger.warning(
                     "Error scrolling page",

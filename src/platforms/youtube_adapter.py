@@ -270,16 +270,23 @@ class YouTubeAdapter(BasePlatformAdapter):
             )
             
         except Exception as exc:
-            self.logger.error(
-                "YouTube post_comment error",
-                extra={"component": "youtube_adapter", "video_id": video_id, "error": str(exc)}
-            )
             shot = None
             try:
-                # No selenium session exists here; placeholder for future browser-based fallback
-                shot = None
+                if not os.getenv("PYTEST_CURRENT_TEST"):
+                    if not hasattr(self, "_screenshot_dir"):
+                        self._screenshot_dir = "screenshots"
+                    os.makedirs(self._screenshot_dir, exist_ok=True)
+                    fname = f"youtube_error_{video_id or 'unknown'}_{int(time.time())}.log"
+                    fpath = os.path.join(self._screenshot_dir, fname)
+                    with open(fpath, "w", encoding="utf-8") as f:
+                        f.write(str(exc))
+                    shot = fpath
             except Exception:
                 shot = None
+            self.logger.error(
+                "YouTube post_comment error",
+                extra={"component": "youtube_adapter", "video_id": video_id, "error": str(exc), "screenshot": shot}
+            )
             return AdapterResult(success=False, data={'video_id': video_id, "screenshot": shot} if shot else {'video_id': video_id}, error=str(exc), retry_recommended=True)
 
     def get_comment_metrics(self, comment_id: str) -> AdapterResult:
