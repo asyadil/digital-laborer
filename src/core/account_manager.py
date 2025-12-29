@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from src.database.models import Account, AccountStatus
 from src.database.operations import DatabaseSessionManager
+from src.utils.crypto import credential_manager
 
 
 class AccountManager:
@@ -36,6 +37,17 @@ class AccountManager:
             if account:
                 return account
         return None
+
+    def get_account_credentials(self, account: Account) -> Dict[str, Any]:
+        """Return decrypted credential payload for an account record."""
+        return {
+            "id": account.id,
+            "username": account.username,
+            "password": credential_manager.decrypt(account.password_encrypted) if account.password_encrypted else None,
+            "platform": account.platform.value if hasattr(account.platform, "value") else account.platform,
+            "health_score": account.health_score,
+            "metadata": account.metadata_json or {},
+        }
 
     def rotate_accounts(self, platform: str) -> Optional[Account]:
         """Disable current best if unhealthy and pick next best."""

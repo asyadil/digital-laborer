@@ -8,7 +8,7 @@ import asyncio
 import logging
 import signal
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, Any
 import os
 import yaml
 
@@ -234,6 +234,8 @@ class SystemOrchestrator:
                 target_post = find_result.data["items"][0]
                 if self.account_manager:
                     acct = self.account_manager.get_best_account("reddit")
+                    if not acct:
+                        acct = self.account_manager.rotate_accounts("reddit")
                     account = acct.id if acct else None
 
             # Post the content
@@ -362,6 +364,31 @@ class SystemOrchestrator:
                 "last_persisted_at": datetime.utcnow().isoformat(),
             },
         )
+
+    def _validate_config(self) -> None:
+        """Basic config validation to fail fast on missing critical fields."""
+        cfg = self.config_manager.config
+        errors = []
+        if not getattr(cfg.telegram, "bot_token", None):
+            errors.append("telegram.bot_token missing")
+        if not getattr(cfg.telegram, "user_chat_id", None):
+            errors.append("telegram.user_chat_id missing")
+        db_cfg = getattr(cfg, "database", None)
+        if not db_cfg or not getattr(db_cfg, "path", None):
+            errors.append("database.path missing")
+        if getattr(cfg.platforms, "reddit", None) and getattr(cfg.platforms.reddit, "enabled", False):
+            oauth = getattr(cfg.platforms.reddit, "oauth", None)
+            required = ["client_id", "client_secret", "user_agent", "username", "password"]
+            for key in required:
+                if not getattr(oauth, key, None):
+                    errors.append(f"platforms.reddit.oauth.{key} missing")
+        if getattr(cfg.platforms, "youtube", None) and getattr(cfg.platforms.youtube, "enabled", False):
+            ykeys = ["client_id", "client_secret"]
+            for key in ykeys:
+                if not getattr(cfg.platforms.youtube, key, None):
+                    errors.append(f"platforms.youtube.{key} missing")
+        if errors:
+            raise ValueError(f"Configuration errors: {', '.join(errors)}")
 
     def _seconds_until_utc_hour(self, hour: int) -> int:
         now = datetime.utcnow()
@@ -597,6 +624,11 @@ class SystemOrchestrator:
                 "Health check failed",
                 extra={"component": "health", "error": str(exc)},
             )
+        finally:
+            if self.account_manager:
+                # Reactivate or disable accounts based on health drift
+                self.account_manager.disable_unhealthy_accounts(threshold=0.25)
+                self.account_manager.reactivate_recovered_accounts()
 
     async def _send_daily_analytics(self, weekly: bool = False) -> None:
         if not self.analytics or not self.telegram:
