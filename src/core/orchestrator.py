@@ -507,6 +507,9 @@ class SystemOrchestrator:
                     # Send error notification with actionable buttons
                     if self.telegram:
                         note = "blocked_auto" if blocked else "error"
+                        guidance = ""
+                        if playbook and code == "captcha_required":
+                            guidance = "\n".join([f"📋 {playbook.title}"] + [f"- {step}" for step in playbook.steps])
                         keyboard = InlineKeyboardMarkup(
                             [
                                 [
@@ -523,6 +526,8 @@ class SystemOrchestrator:
                             f"📝 Post ID: {post_id}\n"
                             f"❌ Error: {error_msg}"
                         )
+                        if guidance:
+                            message += f"\n\n{guidance}"
                         await self.telegram.send_notification(message, priority="ERROR", reply_markup=keyboard)
                     
                     self.logger.error(
@@ -637,11 +642,6 @@ class SystemOrchestrator:
                 await self.telegram.send_notification("System shutting down", priority="WARNING")
                 await self.telegram.stop()
             self._persist_state()
-        except Exception as exc:
-            self.logger.error(
-                "Error during shutdown",
-                extra={"component": "orchestrator", "error": str(exc)},
-            )
 
     async def _check_adapter_health(self, platform: str) -> None:
         """Simple health check hook for new adapters."""
@@ -852,70 +852,96 @@ class SystemOrchestrator:
         )
 
     def _init_platform_adapters(self) -> None:
-        """Initialize platform adapters with configuration."""
-        cfg = self.config_manager.config
+        # Shared rate limiter refs for orchestrator-level limits
+        shared_limiters = self.platform_limiters
         self.reddit_adapter = None  # instantiate on demand with active DB session
         try:
             self.youtube_adapter = YouTubeAdapter(
-                config=cfg,
+                config=self.config_manager.config,
                 credentials=[],
                 logger=self.logger.getChild("youtube"),
                 telegram=self.telegram,
             )
             self._set_health("youtube", "healthy")
         except Exception as exc:
-            self.youtube_adapter = None
-            self._set_health("youtube", "degraded", reason=str(exc))
             self.logger.error(
-                "Failed to initialize YouTube adapter",
+                "Failed to init YouTube adapter",
                 extra={"component": "orchestrator", "error": str(exc)},
             )
+            self.youtube_adapter = None
         # TikTok
         try:
             self.tiktok_adapter = TikTokAdapter(
-                config=cfg,
+                config=self.config_manager.config,
                 logger=self.logger.getChild("tiktok"),
                 telegram=self.telegram,
             )
             self._set_health("tiktok", "healthy")
         except Exception as exc:
-            self.tiktok_adapter = None
-            self._set_health("tiktok", "degraded", reason=str(exc))
             self.logger.error(
-                "Failed to initialize TikTok adapter",
+                "Failed to init TikTok adapter",
                 extra={"component": "orchestrator", "error": str(exc)},
             )
+            self.tiktok_adapter = None
         # Instagram
         try:
             self.instagram_adapter = InstagramAdapter(
-                config=cfg,
+                config=self.config_manager.config,
                 logger=self.logger.getChild("instagram"),
                 telegram=self.telegram,
             )
             self._set_health("instagram", "healthy")
         except Exception as exc:
-            self.instagram_adapter = None
-            self._set_health("instagram", "degraded", reason=str(exc))
             self.logger.error(
-                "Failed to initialize Instagram adapter",
+                "Failed to init Instagram adapter",
                 extra={"component": "orchestrator", "error": str(exc)},
             )
+            self.instagram_adapter = None
         # Facebook
         try:
             self.facebook_adapter = FacebookAdapter(
-                config=cfg,
+                config=self.config_manager.config,
                 logger=self.logger.getChild("facebook"),
                 telegram=self.telegram,
             )
             self._set_health("facebook", "healthy")
         except Exception as exc:
-            self.facebook_adapter = None
-            self._set_health("facebook", "degraded", reason=str(exc))
             self.logger.error(
-                "Failed to initialize Facebook adapter",
+                "Failed to init Facebook adapter",
                 extra={"component": "orchestrator", "error": str(exc)},
             )
-        # Integrate monitoring helpers with adapters if needed later
+            self.facebook_adapter = None
+
+    def _on_network_change(self, platform: str) -> None:
+        """Hot-reload adapter identity pools after /netid updates."""
+        platform = (platform or "").lower()
+        if platform == "tiktok" and self.tiktok_adapter:
+            try:
+                self.tiktok_adapter._rotate_identity()
+                self.logger.info("Refreshed TikTok identity pool", extra={"component": "orchestrator"})
+            except Exception as exc:
+                self.logger.error("Failed to refresh TikTok identity pool", extra={"component": "orchestrator", "error": str(exc)})
+        elif platform == "instagram" and self.instagram_adapter:
+            try:
+                self.instagram_adapter._rotate_identity()
+                self.logger.info("Refreshed Instagram identity pool", extra={"component": "orchestrator"})
+            except Exception as exc:
+                self.logger.error(
+                    "Failed to refresh Instagram identity pool",
+                    extra={"component": "orchestrator", "error": str(exc)},
+                )
+        elif platform == "facebook" and self.facebook_adapter:
+            try:
+                self.facebook_adapter._rotate_identity()
+                self.logger.info("Refreshed Facebook identity pool", extra={"component": "orchestrator"})
+            except Exception as exc:
+                self.logger.error("Failed to refresh Facebook identity pool", extra={"component": "orchestrator", "error": str(exc)})
+        elif platform == "youtube" and self.youtube_adapter and hasattr(self.youtube_adapter, "reload_network"):
+            try:
+                self.youtube_adapter.reload_network()
+                self.logger.info("Refreshed YouTube network identity", extra={"component": "orchestrator"})
+            except Exception as exc:
+                self.logger.error("Failed to refresh YouTube network identity", extra={"component": "orchestrator", "error": str(exc)})
 
     def _get_reddit_adapter(self) -> tuple[Optional[RedditAdapter], Optional[object]]:
         """Create a RedditAdapter with a dedicated session for posting/health checks."""
@@ -948,6 +974,7 @@ class SystemOrchestrator:
                 db=self.db,
                 logger=self.logger.getChild("telegram"),
                 log_file_path=self.config_manager.config.logging.file_path,
+                on_network_change=self._on_network_change,
             )
             self._set_health("telegram", "healthy")
         except Exception as exc:
@@ -1115,6 +1142,7 @@ class SystemOrchestrator:
         score = quality.get("score", 0.0)
         template_id = post_data.get("template_id")
         limiter = self.platform_limiters.get(platform)
+        warnings = post_data.get("warnings") or []
         if self.platform_paused.get(platform):
             self.logger.warning(
                 "Platform %s paused due to degraded health; skipping draft",
@@ -1146,13 +1174,23 @@ class SystemOrchestrator:
                     "template_id": template_id,
                     "quality": quality,
                     "errors": post_data.get("errors"),
-                    "warnings": post_data.get("warnings"),
+                    "warnings": warnings,
                     **meta,
                 },
             )
             session.add(post)
             session.flush()
             post_id = post.id
+
+        # Alert path for novelty/referral issues
+        if self.telegram and warnings:
+            critical_flags = [w for w in warnings if "duplicate_content_recent" in w or "alert_missing_referral_link" in w]
+            if critical_flags:
+                preview = (post_data.get("content") or "")[:400]
+                await self.telegram.send_notification(
+                    f"⚠️ Draft warning {platform.upper()}: {', '.join(critical_flags)}\nScore={score:.2f}\nPreview:\n{preview}",
+                    priority="WARN",
+                )
 
         if self.telegram and score < threshold:
             context = {

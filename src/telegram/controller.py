@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Union
 import itertools
+from pathlib import Path
 from src.telegram.playbooks import build_playbook
 
 from telegram import (
@@ -44,6 +45,7 @@ from src.database.operations import DatabaseSessionManager
 from src.telegram import handlers
 from src.utils.rate_limiter import FixedWindowRateLimiter
 from src.utils.validators import sanitize_markdown, validate_email
+from src.monitoring.audit import AuditLogger
 
 
 @dataclass
@@ -81,6 +83,7 @@ class TelegramController:
         db: DatabaseSessionManager,
         logger: Optional[logging.Logger] = None,
         log_file_path: Optional[str] = None,
+        on_network_change: Optional[Any] = None,
     ) -> None:
         self.bot_token = bot_token
         self.user_chat_id = str(user_chat_id)
@@ -88,6 +91,10 @@ class TelegramController:
         self.db = db
         self.logger = logger or logging.getLogger("telegram")
         self.log_file_path = log_file_path
+        self.on_network_change = on_network_change
+        if log_file_path:
+            audit_path = Path(log_file_path).with_name("audit.log")
+            AuditLogger.configure(file_path=str(audit_path), logger=self.logger.getChild("audit"))
 
         self.started_at = datetime.utcnow()
         self.paused = False
@@ -111,6 +118,18 @@ class TelegramController:
     @property
     def pending_actions_count(self) -> int:
         return len(self._pending_futures)
+
+    def notify_network_change(self, platform: str) -> None:
+        """Trigger orchestrator-level callback when network identity changes."""
+        if not self.on_network_change:
+            return
+        try:
+            self.on_network_change(platform)
+        except Exception as exc:
+            self.logger.error(
+                "Failed to propagate network change",
+                extra={"component": "telegram", "platform": platform, "error": str(exc)},
+            )
 
     async def start(self) -> None:
         """Start Telegram polling and background queue worker."""

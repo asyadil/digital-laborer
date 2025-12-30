@@ -67,7 +67,7 @@ synonyms:
   aman_terjaga: [aman, terjaga, terlindungi, secure, safety, guarded, shielded, protected, locked, dibentengi, aman betul]
 
   # Adverbia (20)
-  cepat_adv: [dengan cepat, lekas, segera, kilat, buru-buru, secepatnya, instan, langsung, sigap, tangkas]
+  cepat_adv: [dengan cepat, cepet, lekas, segera, kilat, buru-buru, secepatnya, instan, langsung, sigap, tangkas]
   sangat: [sangat, amat, banget, luar biasa, banget sekali, super, mega, ultra, ekstrim, parah]
   benar2: [sungguh, benar-benar, betul-betul, amat sangat, memang, totally, entirely, completely, sepenuhnya, beneran]
   hati2: [hati-hati, dengan hati-hati, cermat, teliti, pelan-pelan, seksama, waspada, awas, jangan sembrono, hati-hati sekali]
@@ -81,13 +81,13 @@ synonyms:
   halus_adv: [halus, lembut, smooth, pelan, perlahan, hati-hati, sopan, santun, ringan, subtle]
 
   # Nomina umum (20)
-  masalah: [masalah, isu, kendala, hambatan, tantangan, kesulitan, problem, trouble, error, error code]
+  masalah: [masalah, hal bikin pusing, isu, kendala, hambatan, tantangan, kesulitan, problem, trouble, error, error code]
   solusi: [solusi, jawaban, perbaikan, remedi, jalan keluar, fix, penawar, opsi, langkah, treatment]
   ide: [ide, gagasan, pemikiran, konsep, usulan, saran, pendapat, opini, insight, ilham]
   metrik: [metrik, indikator, pengukuran, KPI, sinyal, parameter, angka, statistik, ukuran, data]
   risiko: [risiko, bahaya, ancaman, kerawanan, potensi, hazard, eksposur, liability, downside, risiko tersembunyi]
-  imbal: [imbal, hasil, return, manfaat, benefit, gain, reward, payoff, payout, imbalan]
-  uang: [uang, dana, modal, kapital, kas, aset, duit, fulus, receh, saldo]
+  imbal: [benefit, imbal, hasil, return, manfaat, benefit, gain, reward, payoff, payout, imbalan]
+  uang: [uang, cuan, harta, segepok, dana, modal, kapital, kas, aset, duit, fulus, receh, saldo]
   biaya: [biaya, biaya operasional, beban, ongkos, harga, tarif, cost, expenditure, spending, pengeluaran]
   anggaran: [anggaran, alokasi, budget, plafon, limit, porsi, pos, ceiling, batas, kuota]
   waktu: [waktu, durasi, slot, jadwal, periode, rentang, interval, tenggat, timing, window]

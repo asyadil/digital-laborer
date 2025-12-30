@@ -49,6 +49,7 @@ from src.database.operations import DatabaseSessionManager
 from src.utils.rate_limiter import FixedWindowRateLimiter
 from src.utils.validators import sanitize_markdown, validate_email, validate_url
 from src.monitoring.analytics import Analytics
+from src.monitoring.audit import AuditLogger
 
 
 def _format_kv(title: str, value: Any, max_length: int = 200) -> str:
@@ -417,6 +418,15 @@ async def cmd_secret(controller, update: Update, context: ContextTypes.DEFAULT_T
         data[key] = val
         _save_env_file(env_path, data)
         os.environ[key] = val
+        try:
+            AuditLogger.log(
+                actor=str(update.effective_user.id) if update.effective_user else "unknown",
+                action="secret_update",
+                target=key,
+                metadata={"chat_id": str(update.effective_chat.id) if update.effective_chat else None},
+            )
+        except Exception:
+            pass
         await controller._send_text(
             update.effective_chat.id,
             f"✅ Secret `{key}` updated (stored in .env).",
@@ -513,6 +523,20 @@ async def cmd_netid(controller, update: Update, context: ContextTypes.DEFAULT_TY
             lines.append(f"- user_agents set ({len(new_uas)})")
         lines.append("_Catatan_: adapter yang sudah aktif mungkin perlu restart ringan agar pool baru dipakai._")
         await controller._send_text(update.effective_chat.id, "\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2)
+        controller.notify_network_change(platform)
+        try:
+            AuditLogger.log(
+                actor=str(update.effective_user.id) if update.effective_user else "unknown",
+                action="netid_update",
+                target=platform,
+                metadata={
+                    "chat_id": str(update.effective_chat.id) if update.effective_chat else None,
+                    "proxies_count": len(new_proxies or []),
+                    "ua_count": len(new_uas or []),
+                },
+            )
+        except Exception:
+            pass
     except Exception as exc:
         controller.logger.error("Error in netid command", exc_info=True)
         await controller._safe_notify_error("cmd_netid", exc)

@@ -3,7 +3,6 @@ import types
 from src.platforms.tiktok_adapter import TikTokAdapter
 from src.platforms.instagram_adapter import InstagramAdapter
 from src.platforms.facebook_adapter import FacebookAdapter
-from src.platforms.base_adapter import RateLimitError
 
 
 def _stub_config():
@@ -24,11 +23,12 @@ def test_instagram_adapter_rate_limit(monkeypatch):
     # Force rate limit
     monkeypatch.setattr(adapter.rate_limiter, "try_acquire", lambda tokens=1: False)
     monkeypatch.setattr(adapter.daily_limiter, "try_acquire", lambda tokens=1: False)
-    try:
-        adapter.post_comment(target_id="abc", content="hi", account={"username": "tester"})
-        assert False, "expected RateLimitError"
-    except RateLimitError:
-        assert True
+    res = adapter.post_comment(target_id="abc", content="hi", account={"username": "tester"})
+    assert res.success is False
+    assert res.data.get("error_code") == "rate_limit"
+    assert res.data.get("backoff_seconds") >= 0
+    assert res.data.get("rotate_identity") is True
+    assert res.retry_recommended is True
 
 
 def test_facebook_adapter_find_targets():

@@ -48,6 +48,7 @@ class BasePlatformAdapter(abc.ABC):
         self.logger = logger or logging.getLogger(self.__class__.__name__)
         self.telegram = telegram
         self._proxy_failures: Dict[str, float] = {}
+        self._proxy_failure_counts: Dict[str, int] = {}
         self._rng = random.Random()
 
     @abc.abstractmethod
@@ -89,7 +90,8 @@ class BasePlatformAdapter(abc.ABC):
                 last_error = str(exc)
                 if rotate_identity_cb:
                     rotate_identity_cb()
-                time.sleep(delay)
+                jitter = self._rng.uniform(0.85, 1.3)
+                time.sleep(delay * jitter)
                 delay = min(delay * 2, 60)
             except PlatformAdapterError as exc:
                 return AdapterResult(
@@ -128,8 +130,20 @@ class BasePlatformAdapter(abc.ABC):
         return ua, proxy
 
     def _mark_proxy_failure(self, proxy: Optional[str], cooldown_seconds: int = 300) -> None:
-        if proxy:
-            self._proxy_failures[proxy] = time.time() + max(1, cooldown_seconds)
+        if not proxy:
+            return
+        current = self._proxy_failure_counts.get(proxy, 0) + 1
+        self._proxy_failure_counts[proxy] = current
+        backoff = min(cooldown_seconds * (2 ** (current - 1)), 3600)
+        self._proxy_failures[proxy] = time.time() + max(5, backoff)
+
+    def _mark_proxy_success(self, proxy: Optional[str]) -> None:
+        if not proxy:
+            return
+        if proxy in self._proxy_failure_counts:
+            self._proxy_failure_counts[proxy] = 0
+        if proxy in self._proxy_failures:
+            self._proxy_failures.pop(proxy, None)
 
     @abc.abstractmethod
     def get_comment_metrics(self, comment_url: str) -> AdapterResult:

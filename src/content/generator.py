@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections import deque
 import random
 import re
 from dataclasses import dataclass
@@ -45,6 +46,8 @@ class ContentGenerator:
         )
         self.referral_links = referral_links or []
         self.default_locale = str(getattr(getattr(config, "content", None), "default_locale", "en") or "en").lower()
+        self._recent_fingerprints: deque[str] = deque(maxlen=200)
+        self._fingerprint_set: set[str] = set()
 
     def generate_reddit_comment(
         self, subreddit: str, context: Optional[Dict[str, Any]] = None, locale: Optional[str] = None
@@ -188,7 +191,12 @@ class ContentGenerator:
             warnings.append("Used fallback template")
 
         # Ensure there is at least one helpful link placeholder if config provides it.
-        raw = self._inject_links(raw, ctx)
+        default_link = self._default_referral_link(platform, locale=locale) if platform else None
+        ctx["_default_referral_link"] = default_link
+        if not default_link and not context.get("referral_link") and not context.get("referral_links"):
+            warnings.append(f"missing_referral_link:{platform}:{locale or self.default_locale}")
+            warnings.append("alert_missing_referral_link")
+        raw = self._inject_links(raw, ctx, default_link=default_link)
 
         # Paraphrase lightly for variation
         try:
@@ -206,7 +214,21 @@ class ContentGenerator:
         if spam_hits:
             warnings.append(f"spam_indicators: {', '.join(spam_hits)}")
 
+        novelty_hits = self._novelty_flags(trimmed)
+        if novelty_hits:
+            warnings.extend(novelty_hits)
+
         sanitized = self._sanitize_output(trimmed)
+
+        fp = self._fingerprint_content(sanitized)
+        if fp in self._fingerprint_set:
+            warnings.append("duplicate_content_recent")
+        else:
+            if len(self._recent_fingerprints) >= self._recent_fingerprints.maxlen:
+                oldest = self._recent_fingerprints.popleft()
+                self._fingerprint_set.discard(oldest)
+            self._recent_fingerprints.append(fp)
+            self._fingerprint_set.add(fp)
 
         return {
             "platform": platform,
@@ -273,40 +295,21 @@ class ContentGenerator:
             return text.strip()
         if len(words) > max_words:
             # truncate at word boundary
-            kept = words[:max_words]
-            # rebuild by walking original text and stopping after max_words
             count = 0
             out = []
             for token in re.split(r"(\s+)", text):
                 if not token:
                     continue
-                if re.fullmatch(r"\s+", token):
+                if re.match(r"\s+", token):
+                    if count >= max_words:
+                        continue
                     out.append(token)
                     continue
-                # count words in token
-                w = re.findall(r"\b\w+\b", token)
-                if w:
-                    if count + len(w) > max_words:
-                        break
-                    count += len(w)
+                if count >= max_words:
+                    break
                 out.append(token)
+                count += 1
             return "".join(out).strip()
-        return text
-
-    def _inject_links(self, text: str, context: Dict[str, Any]) -> str:
-        # Keep deterministic and safe: do not add if already has links.
-        if _LINK_RE.search(text):
-            return text
-        # If context provides referral_link, insert once.
-        link = context.get("referral_link")
-        if isinstance(link, str) and link.startswith("http"):
-            return text + f"\n\nHelpful resource: {self._sanitize_link(link)}"
-        # Fallback to default platform link if available
-        platform = context.get("platform")
-        locale = context.get("locale")
-        default_link = self._default_referral_link(platform, locale=locale) if platform else None
-        if default_link:
-            return text + f"\n\nHelpful resource: {self._sanitize_link(default_link)}"
         return text
 
     def _spam_indicators(self, text: str) -> List[str]:
@@ -318,6 +321,55 @@ class ContentGenerator:
         if lower.count("http") > 2:
             hits.append("too_many_links")
         return hits
+
+    def _novelty_flags(self, text: str) -> List[str]:
+        """Lightweight novelty/dedup heuristics."""
+        flags: List[str] = []
+        lower = text.lower()
+        if lower.count("http") > 3:
+            flags.append("too_many_links_novelty")
+        if len(set(lower.split())) < max(10, len(lower.split()) * 0.3):
+            flags.append("low_word_variety")
+        return flags
+
+    def _fingerprint_content(self, text: str) -> str:
+        """Stable fingerprint to detect recent duplicates."""
+        normalized = self._normalize_whitespace(text).lower()
+        normalized = re.sub(r"\s+", " ", normalized)
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+    def _inject_links(self, text: str, context: Dict[str, Any], default_link: Optional[str] = None) -> str:
+        links = context.get("referral_links") or []
+        if not isinstance(links, list):
+            links = []
+
+        if context.get("referral_link"):
+            links = links + [context["referral_link"]]
+
+        # Remove duplicates and empty
+        seen = set()
+        unique_links = []
+        for link in links:
+            if not link:
+                continue
+            norm = link.strip()
+            if not norm or norm in seen:
+                continue
+            seen.add(norm)
+            unique_links.append(norm)
+
+        if unique_links:
+            sanitized_links = [self._sanitize_link(link) for link in unique_links]
+            links_text = "\n".join(f"- {link}" for link in sanitized_links)
+            return text + "\n\nHelpful resources:\n" + links_text
+
+        # Fallback to default platform link if available
+        platform = context.get("platform")
+        locale = context.get("locale")
+        default_link = default_link or (self._default_referral_link(platform, locale=locale) if platform else None)
+        if default_link:
+            return text + f"\n\nHelpful resource: {self._sanitize_link(default_link)}"
+        return text
 
     def _apply_platform_structure(self, platform: str, text: str, context: Dict[str, Any]) -> str:
         """Apply platform-specific formatting before scoring/length enforcement."""
@@ -395,7 +447,7 @@ class ContentGenerator:
         return sections
 
     def _sanitize_link(self, link: str) -> str:
-        return re.sub(r"[\\s<>\"']", "", link).strip()
+        return re.sub(r"[\s<>\"']", "", link).strip()
 
     def _sanitize_output(self, text: str) -> str:
         """Basic sanitation to avoid injection/formatting issues (Markdown-safe)."""

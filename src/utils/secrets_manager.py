@@ -10,6 +10,8 @@ Secrets are never logged; only sources are recorded for auditability.
 """
 from __future__ import annotations
 
+import base64
+import hashlib
 import logging
 import os
 import stat
@@ -28,6 +30,7 @@ PLACEHOLDER_VALUES = {"", "REPLACE_ME", "CHANGE_ME", "TODO", "xxx", "XXXX", "RED
 DEFAULT_ENV_FILE = Path(os.getenv("APP_BASE_PATH", Path.cwd())) / ".env"
 DEFAULT_FALLBACK_FILE = Path(os.getenv("APP_BASE_PATH", Path.cwd())) / "data" / ".secrets_backup"
 EXPECTED_PERMS = 0o600
+ENV_ENC_KEY_NAME = "SECRET_ENC_KEY"
 
 LOGGER = logging.getLogger(__name__)
 
@@ -53,6 +56,29 @@ def _parse_env_file(path: Path) -> Dict[str, str]:
             k, v = stripped.split("=", 1)
             values[k.strip()] = v.strip()
     return values
+
+
+def _xor_crypt(data: bytes, key: bytes) -> bytes:
+    if not key:
+        raise ValueError("Encryption key missing")
+    out = bytearray()
+    for i, b in enumerate(data):
+        out.append(b ^ key[i % len(key)])
+    return bytes(out)
+
+
+def encrypt_value(value: str, key: str) -> str:
+    """Lightweight reversible encoding with XOR+base64 (placeholder until KMS)."""
+    key_bytes = hashlib.sha256(key.encode("utf-8")).digest()
+    enc = _xor_crypt(value.encode("utf-8"), key_bytes)
+    return "ENC::" + base64.urlsafe_b64encode(enc).decode("utf-8")
+
+
+def _decrypt_value(value: str, key: str) -> str:
+    key_bytes = hashlib.sha256(key.encode("utf-8")).digest()
+    raw = base64.urlsafe_b64decode(value.encode("utf-8"))
+    dec = _xor_crypt(raw, key_bytes)
+    return dec.decode("utf-8")
 
 
 class SecretsManager:
@@ -104,12 +130,13 @@ class SecretsManager:
         source: str,
         validator: Optional[Callable[[str], bool]],
     ) -> str:
-        if self._is_placeholder(value):
+        decrypted = self._maybe_decrypt(value, source=source)
+        if self._is_placeholder(decrypted):
             raise ValueError(f"Secret '{name}' from {source} appears to be a placeholder.")
-        if validator and not validator(value):
+        if validator and not validator(decrypted):
             raise ValueError(f"Secret '{name}' from {source} failed validation.")
         self._log_source(name, source)
-        return value
+        return decrypted
 
     def _get_from_external(self, name: str) -> Optional[str]:
         if not self.external_provider:
@@ -137,6 +164,19 @@ class SecretsManager:
     def _is_placeholder(self, value: str) -> bool:
         normalized = (value or "").strip()
         return normalized in PLACEHOLDER_VALUES or normalized.lower() in {"changeme", "replace_me", "xxx"}
+
+    def _maybe_decrypt(self, value: str, *, source: str) -> str:
+        """Decrypt value if prefixed with ENC:: using SECRET_ENC_KEY."""
+        if not isinstance(value, str) or not value.startswith("ENC::"):
+            return value
+        enc_key = os.getenv(ENV_ENC_KEY_NAME)
+        if not enc_key:
+            raise ValueError(f"Encrypted secret from {source} but SECRET_ENC_KEY not set.")
+        payload = value.split("ENC::", 1)[1]
+        try:
+            return _decrypt_value(payload, enc_key)
+        except Exception as exc:
+            raise ValueError(f"Failed to decrypt secret from {source}: {exc}") from exc
 
     def _log_source(self, name: str, source: str) -> None:
         self.logger.info("Loaded secret '%s' from %s", name, source)

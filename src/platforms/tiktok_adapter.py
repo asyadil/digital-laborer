@@ -30,20 +30,43 @@ class TikTokAdapter(BasePlatformAdapter):
         cfg = getattr(getattr(config, "platforms", None), "tiktok", {}) or {}
         if hasattr(cfg, "dict"):
             cfg = cfg.dict()
-        rate = 1 / max(float(cfg.get("min_delay_between_comments", 120)), 1.0)
+        self.simulate = bool(cfg.get("simulate", True))
+        rate = 1 / max(cfg.get("min_delay_between_comments", 60), 1)
         self.rate_limiter = TokenBucketRateLimiter(rate=rate, capacity=3)
         self.daily_limiter = TokenBucketRateLimiter(
             rate=cfg.get("max_comments_per_day", 30) / 86400.0, capacity=max(cfg.get("max_comments_per_day", 30), 1)
         )
+        self.challenge_probability = float(cfg.get("challenge_probability", 0.01))
+        self.rate_limit_cooldown = int(cfg.get("rate_limit_cooldown_seconds", 120))
+        self._cfg_ref = getattr(getattr(config, "platforms", None), "tiktok", None)
         self._ua_pool = cfg.get("user_agents") or []
         self._proxy_pool = cfg.get("proxies") or []
         self._current_ua: Optional[str] = None
         self._current_proxy: Optional[str] = None
 
     def _rotate_identity(self) -> None:
+        cfg_obj = self._cfg_ref
+        if hasattr(cfg_obj, "dict"):
+            cfg = cfg_obj.dict()
+        elif isinstance(cfg_obj, dict):
+            cfg = cfg_obj
+        else:
+            cfg = {}
+        self._ua_pool = cfg.get("user_agents") or self._ua_pool
+        self._proxy_pool = cfg.get("proxies") or self._proxy_pool
         ua, proxy = self._choose_identity(self._ua_pool, self._proxy_pool)
         self._current_ua = ua or pick_random_user_agent()
         self._current_proxy = proxy
+
+    def _require_auth(self, account: Dict[str, Any]) -> None:
+        if self.simulate:
+            return
+        if not account.get("auth_token") and not account.get("session_cookies"):
+            raise AuthenticationError("TikTok credentials missing (auth_token/session_cookies).")
+
+    def _post_comment_real(self, target_id: str, content: str, account: Dict[str, Any]) -> AdapterResult:
+        # Placeholder for real integration (API/automation driver).
+        raise PlatformAdapterError("TikTok real posting not implemented; enable simulate or provide driver.")
 
     def login(self, account: Dict[str, Any]) -> AdapterResult:
         # Stub: assume credentials already available; rotate identity.
@@ -65,12 +88,36 @@ class TikTokAdapter(BasePlatformAdapter):
         # Rate limiting
         if not (self.rate_limiter.try_acquire() and self.daily_limiter.try_acquire()):
             self._mark_proxy_failure(self._current_proxy)
-            raise RateLimitError("TikTok rate limit reached")
+            return AdapterResult(
+                success=False,
+                data={
+                    "error_code": "rate_limit",
+                    "backoff_seconds": self.rate_limit_cooldown,
+                    "rotate_identity": True,
+                },
+                error=f"TikTok rate limit reached; cooldown {self.rate_limit_cooldown}s",
+                retry_recommended=True,
+            )
         self._rotate_identity()
+        self._require_auth(account)
         # Simulate anti-bot challenge probability
-        if random.random() < 0.01:
-            raise AntiBotChallengeError("Captcha or verification required")
+        if random.random() < self.challenge_probability:
+            return AdapterResult(
+                success=False,
+                data={
+                    "error_code": "captcha_required",
+                    "challenge_type": "captcha_or_verification",
+                    "rotate_identity": True,
+                    "backoff_seconds": 300,
+                },
+                error="Captcha or verification required",
+                retry_recommended=False,
+            )
+        if not self.simulate:
+            return self._post_comment_real(target_id, content, account)
+
         comment_id = f"ttc_{int(time.time())}_{random.randint(1000,9999)}"
+        self._mark_proxy_success(self._current_proxy)
         return AdapterResult(
             success=True,
             data={
