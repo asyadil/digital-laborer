@@ -5,7 +5,7 @@ import hashlib
 import random
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from src.content.paraphraser import RuleBasedParaphraser
 from src.content.quality_scorer import QualityScorer
@@ -44,21 +44,29 @@ class ContentGenerator:
             min_sections=3,
         )
         self.referral_links = referral_links or []
+        self.default_locale = str(getattr(getattr(config, "content", None), "default_locale", "en") or "en").lower()
 
-    def generate_reddit_comment(self, subreddit: str, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def generate_reddit_comment(
+        self, subreddit: str, context: Optional[Dict[str, Any]] = None, locale: Optional[str] = None
+    ) -> Dict[str, Any]:
         return self._generate(
             platform="reddit",
             context={
                 "subreddit": subreddit,
                 "tone": "practical",
-                "referral_link": (context or {}).get("referral_link") if context else self._default_referral_link("reddit"),
+                "locale": locale,
+                "referral_link": (context or {}).get("referral_link")
+                if context
+                else self._default_referral_link("reddit", locale=locale),
                 **(context or {}),
             },
             min_words=200,
             max_words=500,
         )
 
-    def generate_youtube_comment(self, video_title: str, video_description: str) -> Dict[str, Any]:
+    def generate_youtube_comment(
+        self, video_title: str, video_description: str, locale: Optional[str] = None
+    ) -> Dict[str, Any]:
         topic = self._extract_topic(video_title + " " + (video_description or ""))
         return self._generate(
             platform="youtube",
@@ -67,13 +75,18 @@ class ContentGenerator:
                 "topic": topic,
                 "video_description": video_description,
                 "cta": "If you want the walkthrough + link, check the first reply — happy to share what worked for me.",
-                "referral_link": (context or {}).get("referral_link") if context else self._default_referral_link("youtube"),
+                "locale": locale,
+                "referral_link": (context or {}).get("referral_link")
+                if context
+                else self._default_referral_link("youtube", locale=locale),
             },
             min_words=150,
             max_words=400,
         )
 
-    def generate_quora_answer(self, question: str, existing_answers_summary: str) -> Dict[str, Any]:
+    def generate_quora_answer(
+        self, question: str, existing_answers_summary: str, locale: Optional[str] = None
+    ) -> Dict[str, Any]:
         topic = self._extract_topic(question)
         return self._generate(
             platform="quora",
@@ -86,7 +99,8 @@ class ContentGenerator:
                     "**Body**: 3-5 sections with steps, examples, pitfalls.",
                     "**Conclusion**: recap + next step + referral placement.",
                 ],
-                "referral_links": self._referral_links_for("quora", limit=2),
+                "locale": locale,
+                "referral_links": self._referral_links_for("quora", limit=2, locale=locale),
                 "cta": "If you want a starter bundle with tools and the referral link I used, ask and I’ll share.",
             },
             min_words=800,
@@ -157,10 +171,12 @@ class ContentGenerator:
         warnings: List[str] = []
         ctx = dict(context)
         ctx["platform"] = platform
+        locale = self._resolve_locale(context)
+        ctx["locale"] = locale
 
         try:
             seed = self._stable_seed(platform, context)
-            tpl = self.templates.pick_template(platform=platform, seed=seed)
+            tpl = self.templates.pick_template(platform=platform, seed=seed, locale=locale)
             raw = self.templates.render(tpl.text, context=ctx)
         except (TemplateError, Exception) as exc:
             tpl = None
@@ -287,7 +303,8 @@ class ContentGenerator:
             return text + f"\n\nHelpful resource: {self._sanitize_link(link)}"
         # Fallback to default platform link if available
         platform = context.get("platform")
-        default_link = self._default_referral_link(platform) if platform else None
+        locale = context.get("locale")
+        default_link = self._default_referral_link(platform, locale=locale) if platform else None
         if default_link:
             return text + f"\n\nHelpful resource: {self._sanitize_link(default_link)}"
         return text
@@ -389,36 +406,46 @@ class ContentGenerator:
             text = text.replace(ch, f"\\{ch}")
         return text.strip()
 
-    def _default_referral_link(self, platform: Optional[str]) -> Optional[str]:
-        """Pick first active referral link for the platform if provided."""
+    def _default_referral_link(self, platform: Optional[str], locale: Optional[str] = None) -> Optional[str]:
+        """Pick first active referral link for the platform (and locale if provided)."""
         if not platform:
             return None
-        for item in self.referral_links:
-            if not isinstance(item, dict):
-                continue
-            if not item.get("active", True):
-                continue
-            name = str(item.get("platform_name", "")).lower()
-            if platform.lower() in name:
-                url = item.get("url")
-                if isinstance(url, str) and url.startswith("http"):
-                    return url
-        return None
+        chosen, _ = self._pick_referral(platform, locale=locale, limit=1)
+        return chosen[0] if chosen else None
 
-    def _referral_links_for(self, platform: Optional[str], limit: int = 2) -> List[str]:
+    def _referral_links_for(self, platform: Optional[str], limit: int = 2, locale: Optional[str] = None) -> List[str]:
+        chosen, _ = self._pick_referral(platform, locale=locale, limit=limit)
+        return chosen
+
+    def _pick_referral(
+        self, platform: Optional[str], locale: Optional[str], limit: int
+    ) -> Tuple[List[str], List[Dict[str, Any]]]:
         if not platform:
-            return []
-        selected: List[str] = []
+            return [], []
+        selected_links: List[str] = []
+        selected_meta: List[Dict[str, Any]] = []
+        locale_norm = (locale or self.default_locale or "en").lower()
         for item in self.referral_links:
             if not isinstance(item, dict):
                 continue
             if not item.get("active", True):
                 continue
             name = str(item.get("platform_name", "")).lower()
-            if platform.lower() in name or name in ("generic", "all"):
-                url = item.get("url")
-                if isinstance(url, str) and url.startswith("http"):
-                    selected.append(url)
-            if len(selected) >= limit:
+            if platform.lower() not in name and name not in ("generic", "all"):
+                continue
+            item_locale = str(item.get("locale") or item.get("lang") or "").lower() or "en"
+            if item_locale not in (locale_norm, "all", "any", "generic"):
+                continue
+            url = item.get("url")
+            if isinstance(url, str) and url.startswith("http"):
+                selected_links.append(url)
+                selected_meta.append(item)
+            if len(selected_links) >= limit:
                 break
-        return selected
+        return selected_links, selected_meta
+
+    def _resolve_locale(self, context: Dict[str, Any]) -> str:
+        ctx_locale = context.get("locale")
+        if isinstance(ctx_locale, str) and ctx_locale.strip():
+            return ctx_locale.strip().lower()
+        return self.default_locale

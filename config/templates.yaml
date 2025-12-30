@@ -162,6 +162,30 @@ templates:
       - How long to see results? Expect ~10-14 days.
       Happy to share my script if helpful.
 
+  # Reddit (ID)
+  - id: reddit_id_story_1
+    platform: reddit
+    locale: id
+    name: Cerita singkat
+    min_words: 200
+    max_words: 380
+    text: |
+      Saya sempat coba {{topic|default("aplikasi reward")}} selama 10 hari.
+      Yang jalan: 1 komentar per hari, 1 link saja, gaya bahasa santai.
+      Hasil: akun aman, klik pelan tapi stabil. Kalau mau detail script-nya, bilang saja.
+  - id: reddit_id_tips_1
+    platform: reddit
+    locale: id
+    name: Tips cepat
+    min_words: 200
+    max_words: 360
+    text: |
+      Tips singkat biar aman:
+      - Baca 3-5 thread terbaru dulu
+      - Satu ajakan + satu contoh pribadi
+      - Link disimpan di tengah/akhir
+      Ini ngurangi risiko dihapus mod dan tetap ramah.
+
   # YouTube (15)
   - id: youtube_story_1
     platform: youtube
@@ -238,6 +262,46 @@ templates:
       Sharing a small metric: {{metric|default("first 5 clicks in 3 days")}}.
       Came from one clear CTA and a short anecdote.
       If you want the script, reply and I’ll paste it.
+
+  # YouTube (ID)
+  - id: youtube_id_story_1
+    platform: youtube
+    locale: id
+    name: Cerita ringan
+    min_words: 170
+    max_words: 320
+    text: |
+      Suka video ini karena jujur soal effort.
+      Saya coba {{topic|default("side hustle")}} 10 hari, tambah 1 cerita pribadi + 1 ajakan sopan.
+      Hasilnya lebih banyak reply. Kalau mau teks yang kupakai + link, balas saja.
+  - id: youtube_id_steps_1
+    platform: youtube
+    locale: id
+    name: 3 langkah cepat
+    min_words: 170
+    max_words: 320
+    text: |
+      3 langkah yang kupakai:
+      1) 15-20 menit sehari nulis komentar
+      2) Satu CTA jelas di akhir
+      3) Cek respon, revisi kata-kata mingguan
+      Perlu template + link referal? Kasih tahu ya.
+
+  # Quora (ID)
+  - id: quora_id_answer_1
+    platform: quora
+    locale: id
+    name: Jawaban terstruktur
+    min_words: 700
+    max_words: 1400
+    text: |
+      **Intro**: Jawab singkat pertanyaannya, sebut konteks (waktu/budget).
+      **Isi**:
+      - Langkah 1: aksi konkrit harian
+      - Langkah 2: contoh metrik (klik/daftar)
+      - Langkah 3: pitfall umum + cara menghindar
+      Sisipkan 1-2 resource yang relevan (bukan hard-sell).
+      **Kesimpulan**: rangkum, beri next step, tawarkan template/tautan.
       {{cta}}
   - id: youtube_story_8
     platform: youtube

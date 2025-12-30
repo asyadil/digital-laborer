@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import abc
 import logging
+import random
+import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 
 class PlatformAdapterError(RuntimeError):
@@ -45,6 +47,8 @@ class BasePlatformAdapter(abc.ABC):
         self.config = config
         self.logger = logger or logging.getLogger(self.__class__.__name__)
         self.telegram = telegram
+        self._proxy_failures: Dict[str, float] = {}
+        self._rng = random.Random()
 
     @abc.abstractmethod
     def login(self, account: Dict[str, Any]) -> AdapterResult:
@@ -62,6 +66,70 @@ class BasePlatformAdapter(abc.ABC):
     def post_comment(self, target_id: str, content: str, account: Dict[str, Any]) -> AdapterResult:
         """Post a comment/reply to a target post/thread."""
         raise NotImplementedError
+
+    def post_comment_with_backoff(
+        self,
+        target_id: str,
+        content: str,
+        account: Dict[str, Any],
+        *,
+        max_attempts: int = 3,
+        base_delay: float = 2.0,
+        rotate_identity_cb=None,
+    ) -> AdapterResult:
+        """Optional helper with simple backoff + rotation hook."""
+        attempt = 0
+        delay = base_delay
+        last_error: Optional[str] = None
+        while attempt < max_attempts:
+            attempt += 1
+            try:
+                return self.post_comment(target_id, content, account)
+            except RateLimitError as exc:
+                last_error = str(exc)
+                if rotate_identity_cb:
+                    rotate_identity_cb()
+                time.sleep(delay)
+                delay = min(delay * 2, 60)
+            except PlatformAdapterError as exc:
+                return AdapterResult(
+                    success=False,
+                    data={"error_code": "post_failed"},
+                    error=str(exc),
+                    retry_recommended=False,
+                )
+        return AdapterResult(
+            success=False,
+            data={"error_code": "rate_limit"},
+            error=last_error or "rate_limited",
+            retry_recommended=True,
+        )
+
+    def _choose_identity(
+        self,
+        ua_pool: Optional[list[str]],
+        proxy_pool: Optional[list[str]],
+        *,
+        proxy_cooldown_seconds: int = 300,
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Pick UA and proxy with simple cooldown for bad proxies."""
+        ua = self._rng.choice(ua_pool) if ua_pool else None
+        proxy = None
+        now = time.time()
+        healthy = []
+        if proxy_pool:
+            for p in proxy_pool:
+                expiry = self._proxy_failures.get(p, 0)
+                if expiry and expiry > now:
+                    continue
+                healthy.append(p)
+            pool = healthy or proxy_pool
+            proxy = self._rng.choice(pool)
+        return ua, proxy
+
+    def _mark_proxy_failure(self, proxy: Optional[str], cooldown_seconds: int = 300) -> None:
+        if proxy:
+            self._proxy_failures[proxy] = time.time() + max(1, cooldown_seconds)
 
     @abc.abstractmethod
     def get_comment_metrics(self, comment_url: str) -> AdapterResult:

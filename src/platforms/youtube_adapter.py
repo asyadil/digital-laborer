@@ -47,8 +47,12 @@ class YouTubeAdapter(BasePlatformAdapter):
         self._service = None
         self.captcha_handler = CaptchaHandler(telegram) if telegram else None
         self._jitter_range_ms = (400, 1200)
-        self._proxy_pool = getattr(getattr(config, "platforms", None), "youtube", {}).get("proxies", []) if hasattr(config, "platforms") else []
-        self._ua_pool = getattr(getattr(config, "platforms", None), "youtube", {}).get("user_agents", []) if hasattr(config, "platforms") else []
+        yt_cfg = getattr(getattr(config, "platforms", None), "youtube", {}) if hasattr(config, "platforms") else {}
+        if hasattr(yt_cfg, "dict"):
+            yt_cfg = yt_cfg.dict()
+        yt_cfg = yt_cfg or {}
+        self._proxy_pool = yt_cfg.get("proxies", [])
+        self._ua_pool = yt_cfg.get("user_agents", [])
         self._current_proxy: Optional[str] = None
         self._current_ua: Optional[str] = None
 

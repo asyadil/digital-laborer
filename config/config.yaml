@@ -52,11 +52,33 @@ platforms:
     topics:
       - "Passive Income"
       - "Side Hustles"
+  tiktok:
+    enabled: true
+    max_comments_per_day: 30
+    min_delay_between_comments: 120
+    max_delay_between_comments: 900
+    user_agents: []
+    proxies: []
+  instagram:
+    enabled: true
+    max_comments_per_day: 30
+    min_delay_between_comments: 120
+    max_delay_between_comments: 900
+    user_agents: []
+    proxies: []
+  facebook:
+    enabled: true
+    max_comments_per_day: 20
+    min_delay_between_comments: 180
+    max_delay_between_comments: 1200
+    user_agents: []
+    proxies: []
 
 content:
   min_length: 200
   max_length: 800
   quality_threshold: 0.7
+  default_locale: "en"
   public_sources:
     - "https://www.usa.gov/agencies"
     - "https://archive.org/details/texts"

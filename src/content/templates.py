@@ -17,6 +17,7 @@ class Template:
     text: str
     min_words: int
     max_words: int
+    locale: Optional[str] = None  # e.g., "en", "id"
 
 
 class TemplateError(RuntimeError):
@@ -80,6 +81,7 @@ class TemplateManager:
                     text=text,
                     min_words=min_words,
                     max_words=max_words,
+                    locale=str(t.get("locale") or "").lower() or None,
                 )
             )
         return cls(templates=templates)
@@ -89,10 +91,15 @@ class TemplateManager:
             return list(self._templates)
         return [t for t in self._templates if t.platform == platform]
 
-    def pick_template(self, platform: str, seed: int) -> Template:
+    def pick_template(self, platform: str, seed: int, locale: Optional[str] = None) -> Template:
         candidates = self.list_templates(platform=platform) or self.list_templates(platform="generic")
         if not candidates:
             raise TemplateError("No templates available")
+        if locale:
+            locale = locale.lower()
+            locale_candidates = [t for t in candidates if (t.locale or "en") == locale]
+            if locale_candidates:
+                candidates = locale_candidates
         return candidates[seed % len(candidates)]
 
     def render(self, template_text: str, context: Dict[str, Any]) -> str:

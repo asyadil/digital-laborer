@@ -5,13 +5,17 @@ This orchestrator wires configuration, logging, database, and Telegram.
 from __future__ import annotations
 
 import asyncio
-import logging
-import signal
-from datetime import datetime, timedelta
-from typing import Optional, Any, List, Dict
 import os
-import yaml
+import signal
+import time
+from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Optional, Any, List, Dict
+
+import yaml
+
+from src.telegram.playbooks import build_playbook
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from src.database.operations import create_engine_from_config, init_db, DatabaseSessionManager
 from src.database.models import Post, PostStatus, Account
@@ -19,6 +23,9 @@ from src.database.migrations import run_migrations
 from src.core.scheduler import Scheduler
 from src.platforms.reddit_adapter import RedditAdapter
 from src.platforms.youtube_adapter import YouTubeAdapter
+from src.platforms.tiktok_adapter import TikTokAdapter
+from src.platforms.instagram_adapter import InstagramAdapter
+from src.platforms.facebook_adapter import FacebookAdapter
 from src.core.state_manager import StateManager
 from src.telegram.controller import TelegramController
 from src.utils.config_loader import ConfigManager
@@ -102,6 +109,9 @@ class SystemOrchestrator:
         self.account_manager: Optional[AccountManager] = AccountManager(db=self.db, logger=self.logger.getChild("accounts"))
         self.reddit_adapter: Optional[RedditAdapter] = None
         self.youtube_adapter: Optional[YouTubeAdapter] = None
+        self.tiktok_adapter: Optional[TikTokAdapter] = None
+        self.instagram_adapter: Optional[InstagramAdapter] = None
+        self.facebook_adapter: Optional[FacebookAdapter] = None
         self._stop_event = asyncio.Event()
         self._shutdown_event = asyncio.Event()
         self.service_health: dict[str, str] = {}
@@ -112,6 +122,9 @@ class SystemOrchestrator:
         self.platform_limiters: dict[str, TokenBucketRateLimiter] = {
             "reddit": TokenBucketRateLimiter(rate=1 / 30, capacity=5),   # ~2 per minute burst 5
             "youtube": TokenBucketRateLimiter(rate=1 / 60, capacity=3),  # ~1 per minute burst 3
+            "tiktok": TokenBucketRateLimiter(rate=1 / 120, capacity=3),
+            "instagram": TokenBucketRateLimiter(rate=1 / 120, capacity=3),
+            "facebook": TokenBucketRateLimiter(rate=1 / 180, capacity=3),
         }
         self.platform_paused: dict[str, bool] = {}
 
@@ -240,7 +253,7 @@ class SystemOrchestrator:
         """
         return await self._auto_post_approved_content(post_id)
         
-    async def _auto_post_approved_content(self, post_id: int) -> None:
+    async def _auto_post_approved_content(self, post_id: int, *, force_rotate: bool = False, manual_retry: bool = False) -> None:
         """Post approved content to the target platform.
         
         Args:
@@ -257,8 +270,24 @@ class SystemOrchestrator:
             # Load the post from the database
             with self.db.session_scope() as session:
                 post = session.query(Post).filter(Post.id == post_id).first()
-                if not post or post.status != PostStatus.APPROVED:
-                    self.logger.warning(f"Post {post_id} not found or not approved, skipping auto-post")
+                if not post:
+                    self.logger.warning(f"Post {post_id} not found, skipping auto-post")
+                    return False
+                if manual_retry and post.status in {PostStatus.FAILED, PostStatus.APPROVED}:
+                    post.status = PostStatus.APPROVED
+                    meta = post.metadata_json or {}
+                    meta.pop("blocked_auto", None)
+                    meta.pop("blocked_reason", None)
+                    meta.pop("skip_auto", None)
+                    post.metadata_json = meta
+                    session.add(post)
+                    session.commit()
+                if post.status != PostStatus.APPROVED:
+                    self.logger.warning(f"Post {post_id} status={post.status} not eligible for auto-post")
+                    return False
+                meta = post.metadata_json or {}
+                if meta.get("skip_auto"):
+                    self.logger.info(f"Post {post_id} marked skip_auto; skipping post attempt")
                     return False
                 
                 platform = post.platform
@@ -280,6 +309,12 @@ class SystemOrchestrator:
             adapter_session = None
             if platform == "reddit":
                 adapter, adapter_session = self._get_reddit_adapter()
+            elif platform == "tiktok":
+                adapter = self.tiktok_adapter
+            elif platform == "instagram":
+                adapter = self.instagram_adapter
+            elif platform == "facebook":
+                adapter = self.facebook_adapter
             if not adapter:
                 error_msg = f"No adapter found for platform {platform}"
                 self.logger.error(error_msg)
@@ -292,11 +327,22 @@ class SystemOrchestrator:
                     adapter_session.close()
                 return False
             
-            # Post the content using the adapter
-            self.logger.info(f"Posting content to {platform} (post_id={post_id})...")
-            
+            def _select_account() -> Optional[Dict[str, Any]]:
+                if self.account_manager:
+                    acct = None
+                    if force_rotate:
+                        acct = self.account_manager.rotate_accounts(platform)
+                    else:
+                        acct = self.account_manager.get_best_account(platform)
+                        if not acct:
+                            acct = self.account_manager.rotate_accounts(platform)
+                    if acct:
+                        return self.account_manager.get_account_credentials(acct)
+                return None
+
+            # Prepare target and credentials
             target_post = None
-            account_creds: Optional[Dict[str, Any]] = None
+            account_creds: Optional[Dict[str, Any]] = _select_account()
             if platform == "reddit":
                 subreddit = post.metadata_json.get("subreddit") if post.metadata_json else None
                 if not subreddit:
@@ -308,13 +354,6 @@ class SystemOrchestrator:
                         post.error_message = error_msg
                         session.add(post)
                     return False
-
-                if self.account_manager:
-                    acct = self.account_manager.get_best_account("reddit")
-                    if not acct:
-                        acct = self.account_manager.rotate_accounts("reddit")
-                    if acct:
-                        account_creds = self.account_manager.get_account_credentials(acct)
 
                 find_result = adapter.find_target_posts(
                     location=subreddit,
@@ -334,8 +373,31 @@ class SystemOrchestrator:
                     return False
 
                 target_post = find_result.data["items"][0]
+            elif platform in {"tiktok", "instagram", "facebook"}:
+                location = post.metadata_json.get("location") if post.metadata_json else None
+                if not location:
+                    error_msg = "No location/target context provided"
+                    self.logger.error(error_msg)
+                    with self.db.session_scope() as session:
+                        post = session.merge(post)
+                        post.status = PostStatus.FAILED
+                        post.error_message = error_msg
+                        session.add(post)
+                    return False
+                find_result = adapter.find_target_posts(location=location, limit=3)
+                if not find_result.success or not find_result.data.get("items"):
+                    error_msg = "No suitable targets found"
+                    self.logger.warning(error_msg)
+                    with self.db.session_scope() as session:
+                        post = session.merge(post)
+                        post.status = PostStatus.FAILED
+                        post.error_message = error_msg
+                        session.add(post)
+                    return False
+                target_post = find_result.data["items"][0]
 
             # Post the content
+            self.logger.info(f"Posting content to {platform} (post_id={post_id})...")
             post_result = await adapter.post_comment(
                 target_id=target_post["id"] if target_post else None,
                 content=post.content,
@@ -380,20 +442,88 @@ class SystemOrchestrator:
                     self.logger.info(f"Successfully posted content to {platform} (post_id={post_id})")
                     return True
                 else:
-                    # Handle failure
+                    # Handle failure (with auto-mode retry if allowed)
                     error_msg = post_result.error or "Unknown error"
+                    code = None
+                    backoff_seconds = 0
+                    rotate_flag = False
+                    if isinstance(post_result.data, dict):
+                        code = post_result.data.get("error_code") or code
+                        backoff_seconds = int(post_result.data.get("backoff_seconds") or 0)
+                        rotate_flag = bool(post_result.data.get("rotate_account") or post_result.data.get("rotate_identity"))
+                    playbook = build_playbook(code)
+
+                    # Auto-mode recovery path for auto-safe errors
+                    if self.telegram and getattr(self.telegram, "auto_mode", False) and playbook.auto_safe:
+                        if backoff_seconds > 0:
+                            await asyncio.sleep(min(backoff_seconds, 300))
+                        if rotate_flag:
+                            # rotate account and retry once
+                            account_creds = _select_account()
+                        retry_result = await adapter.post_comment(
+                            target_id=target_post["id"] if target_post else None,
+                            content=post.content,
+                            account=account_creds,
+                        )
+                        if retry_result.success:
+                            post.status = PostStatus.POSTED
+                            post.posted_at = datetime.utcnow()
+                            post.external_id = retry_result.data.get("comment_id")
+                            post.url = retry_result.data.get("comment_url")
+                            metadata = post.metadata_json or {}
+                            metadata.update(
+                                {
+                                    "posted_at": post.posted_at.isoformat(),
+                                    "external_id": post.external_id,
+                                    "url": post.url,
+                                    "account_id": retry_result.data.get("account_id"),
+                                    "username": retry_result.data.get("username"),
+                                    "target_post": target_post if target_post else None,
+                                }
+                            )
+                            post.metadata_json = metadata
+                            session.add(post)
+                            if self.telegram:
+                                await self.telegram.send_notification(
+                                    f"✅ Auto-mode retry succeeded ({platform.upper()}) post_id={post_id}",
+                                    priority="INFO",
+                                )
+                            return True
+
+                    # If still failing
                     post.status = PostStatus.FAILED
                     post.error_message = error_msg
                     session.add(post)
-                    
-                    # Send error notification
+
+                    blocked = False
+                    if self.telegram and getattr(self.telegram, "auto_mode", False) and not playbook.auto_safe:
+                        blocked = True
+                        post.status = PostStatus.APPROVED  # keep approved for manual retry
+                        metadata = post.metadata_json or {}
+                        metadata.update({"blocked_auto": True, "blocked_reason": code or "unknown"})
+                        post.metadata_json = metadata
+                        session.add(post)
+
+                    # Send error notification with actionable buttons
                     if self.telegram:
+                        note = "blocked_auto" if blocked else "error"
+                        keyboard = InlineKeyboardMarkup(
+                            [
+                                [
+                                    InlineKeyboardButton("🔁 Retry", callback_data=f"action:auto:retry:{post_id}"),
+                                    InlineKeyboardButton(
+                                        "🔄 Rotate+Retry", callback_data=f"action:auto:rotate:{post_id}"
+                                    ),
+                                ],
+                                [InlineKeyboardButton("⏭️ Skip", callback_data=f"action:auto:skip:{post_id}")],
+                            ]
+                        )
                         message = (
-                            f"❌ Failed to post to {platform.upper()}\n"
+                            f"❌ Failed to post to {platform.upper()} ({note})\n"
                             f"📝 Post ID: {post_id}\n"
                             f"❌ Error: {error_msg}"
                         )
-                        await self.telegram.send_notification(message, priority="ERROR")
+                        await self.telegram.send_notification(message, priority="ERROR", reply_markup=keyboard)
                     
                     self.logger.error(
                         f"Failed to post content to {platform} (post_id={post_id}): {error_msg}",
@@ -427,6 +557,80 @@ class SystemOrchestrator:
     async def graceful_shutdown(self) -> None:
         try:
             self.logger.info("Graceful shutdown requested", extra={"component": "orchestrator"})
+            if self.alert_manager:
+                self.alert_manager.reset_state()
+            self._stop_event.set()
+            await asyncio.sleep(1.0)
+            self.logger.info("Graceful shutdown complete", extra={"component": "orchestrator"})
+        except Exception as exc:
+            self.logger.error(
+                "Error during shutdown",
+                extra={"component": "orchestrator", "error": str(exc)},
+            )
+        finally:
+            self._shutdown_event.set()
+
+    async def _auto_mode_poster(self, min_quality: float = 0.78, batch_size: int = 5) -> None:
+        """When Telegram auto-mode is active, auto-approve high-quality drafts and post them."""
+        try:
+            manual_rotate: list[int] = []
+            manual_retry: list[int] = []
+            if self.telegram:
+                manual_rotate = self.telegram.consume_auto_rotate()
+                manual_retry = self.telegram.consume_auto_retry()
+
+            # Process manual rotate/retry first, regardless of auto-mode flag
+            for pid in manual_rotate:
+                try:
+                    await self._auto_post_approved_content(pid, force_rotate=True, manual_retry=True)
+                except Exception as exc:
+                    self.logger.error(
+                        "Manual rotate+retry failed",
+                        extra={"component": "orchestrator", "post_id": pid, "error": str(exc)},
+                    )
+            for pid in manual_retry:
+                try:
+                    await self._auto_post_approved_content(pid, manual_retry=True)
+                except Exception as exc:
+                    self.logger.error(
+                        "Manual retry failed",
+                        extra={"component": "orchestrator", "post_id": pid, "error": str(exc)},
+                    )
+
+            if not self.telegram or not getattr(self.telegram, "auto_mode", False):
+                return
+            with self.db.session_scope(logger=self.logger) as session:
+                pending = (
+                    session.query(Post)
+                    .filter(Post.status == PostStatus.PENDING)
+                    .filter(Post.human_approved.is_(False))
+                    .filter(Post.quality_score >= min_quality)
+                    .order_by(Post.created_at.asc())
+                    .limit(batch_size)
+                    .all()
+                )
+                ids_to_post: list[int] = []
+                for post in pending:
+                    post.human_approved = True
+                    post.status = PostStatus.APPROVED
+                    session.add(post)
+                    ids_to_post.append(post.id)
+                session.flush()
+                session.commit()
+
+            for pid in ids_to_post:
+                try:
+                    await self._auto_post_approved_content(pid)
+                except Exception as exc:
+                    self.logger.error(
+                        "Auto-mode post failed",
+                        extra={"component": "orchestrator", "post_id": pid, "error": str(exc)},
+                    )
+        except Exception as exc:
+            self.logger.error(
+                "Auto-mode poster error",
+                extra={"component": "orchestrator", "error": str(exc)},
+            )
             self._stop_event.set()
             self.scheduler.stop()
             if self.telegram is not None:
@@ -438,9 +642,36 @@ class SystemOrchestrator:
                 "Error during shutdown",
                 extra={"component": "orchestrator", "error": str(exc)},
             )
-        finally:
-            self._shutdown_event.set()
 
+    async def _check_adapter_health(self, platform: str) -> None:
+        """Simple health check hook for new adapters."""
+        try:
+            adapter = None
+            if platform == "tiktok":
+                adapter = self.tiktok_adapter
+            elif platform == "instagram":
+                adapter = self.instagram_adapter
+            elif platform == "facebook":
+                adapter = self.facebook_adapter
+            if not adapter:
+                return
+            account = None
+            if self.account_manager:
+                acct = self.account_manager.get_best_account(platform)
+                if acct:
+                    account = self.account_manager.get_account_credentials(acct)
+            if not account:
+                return
+            res = adapter.check_account_health(account)
+            if not res.success:
+                self._set_health(platform, "degraded", reason=res.error or "unknown")
+            else:
+                self._set_health(platform, "healthy")
+        except Exception as exc:
+            self.logger.error(
+                "Adapter health check failed",
+                extra={"component": platform, "error": str(exc)},
+            )
     def _state_key(self) -> str:
         return "orchestrator"
 
@@ -537,6 +768,33 @@ class SystemOrchestrator:
             coro_factory=lambda: self._send_daily_analytics(weekly=True),
         )
 
+        # Auto-mode poster: auto-approve and post high-quality drafts when user idle
+        self.scheduler.schedule_every(
+            "auto_mode_poster",
+            interval_seconds=600,
+            start_in_seconds=60,
+            coro_factory=lambda: self._auto_mode_poster(),
+        )
+        # Adapter health/check loops (stubs for future deeper checks)
+        self.scheduler.schedule_every(
+            "tiktok_health",
+            interval_seconds=1800,
+            start_in_seconds=120,
+            coro_factory=lambda: self._check_adapter_health("tiktok"),
+        )
+        self.scheduler.schedule_every(
+            "instagram_health",
+            interval_seconds=1800,
+            start_in_seconds=150,
+            coro_factory=lambda: self._check_adapter_health("instagram"),
+        )
+        self.scheduler.schedule_every(
+            "facebook_health",
+            interval_seconds=1800,
+            start_in_seconds=180,
+            coro_factory=lambda: self._check_adapter_health("facebook"),
+        )
+
     def _load_content_resources(self) -> None:
         templates_path = os.getenv("TEMPLATES_PATH", os.path.join("config", "templates.yaml"))
         synonyms_path = os.getenv("SYNONYMS_PATH", os.path.join("config", "synonyms.yaml"))
@@ -551,11 +809,26 @@ class SystemOrchestrator:
 
         synonyms: dict = {}
         try:
-            if os.path.exists(synonyms_path):
-                with open(synonyms_path, "r", encoding="utf-8") as f:
+            syn_paths: list[str] = []
+            env_paths = os.getenv("SYNONYMS_PATHS")
+            if env_paths:
+                syn_paths = [p.strip() for p in env_paths.split(",") if p.strip()]
+            else:
+                primary = os.getenv("SYNONYMS_PATH", os.path.join("config", "synonyms.yaml"))
+                syn_paths.append(primary)
+                id_path = os.getenv("SYNONYMS_PATH_ID", os.path.join("config", "synonyms_id.yaml"))
+                if id_path not in syn_paths:
+                    syn_paths.append(id_path)
+
+            for spath in syn_paths:
+                if not os.path.exists(spath):
+                    continue
+                with open(spath, "r", encoding="utf-8") as f:
                     data = yaml.safe_load(f) or {}
                     if isinstance(data, dict):
-                        synonyms = data.get("synonyms", {})
+                        synonyms_section = data.get("synonyms", {})
+                        if isinstance(synonyms_section, dict):
+                            synonyms.update(synonyms_section)
         except Exception as exc:
             self.logger.error(
                 "Failed to load synonyms",
@@ -579,6 +852,7 @@ class SystemOrchestrator:
         )
 
     def _init_platform_adapters(self) -> None:
+        """Initialize platform adapters with configuration."""
         cfg = self.config_manager.config
         self.reddit_adapter = None  # instantiate on demand with active DB session
         try:
@@ -594,6 +868,51 @@ class SystemOrchestrator:
             self._set_health("youtube", "degraded", reason=str(exc))
             self.logger.error(
                 "Failed to initialize YouTube adapter",
+                extra={"component": "orchestrator", "error": str(exc)},
+            )
+        # TikTok
+        try:
+            self.tiktok_adapter = TikTokAdapter(
+                config=cfg,
+                logger=self.logger.getChild("tiktok"),
+                telegram=self.telegram,
+            )
+            self._set_health("tiktok", "healthy")
+        except Exception as exc:
+            self.tiktok_adapter = None
+            self._set_health("tiktok", "degraded", reason=str(exc))
+            self.logger.error(
+                "Failed to initialize TikTok adapter",
+                extra={"component": "orchestrator", "error": str(exc)},
+            )
+        # Instagram
+        try:
+            self.instagram_adapter = InstagramAdapter(
+                config=cfg,
+                logger=self.logger.getChild("instagram"),
+                telegram=self.telegram,
+            )
+            self._set_health("instagram", "healthy")
+        except Exception as exc:
+            self.instagram_adapter = None
+            self._set_health("instagram", "degraded", reason=str(exc))
+            self.logger.error(
+                "Failed to initialize Instagram adapter",
+                extra={"component": "orchestrator", "error": str(exc)},
+            )
+        # Facebook
+        try:
+            self.facebook_adapter = FacebookAdapter(
+                config=cfg,
+                logger=self.logger.getChild("facebook"),
+                telegram=self.telegram,
+            )
+            self._set_health("facebook", "healthy")
+        except Exception as exc:
+            self.facebook_adapter = None
+            self._set_health("facebook", "degraded", reason=str(exc))
+            self.logger.error(
+                "Failed to initialize Facebook adapter",
                 extra={"component": "orchestrator", "error": str(exc)},
             )
         # Integrate monitoring helpers with adapters if needed later
@@ -747,11 +1066,20 @@ class SystemOrchestrator:
         drafted = []
         max_per_day = reddit_cfg.max_posts_per_day
         threshold = reddit_cfg.quality_threshold
-        for idx, subreddit in enumerate(reddit_cfg.subreddits):
-            if idx >= max_per_day:
-                break
-            res = self.content_generator.generate_reddit_comment(subreddit=subreddit)
-            drafted.append(await self._persist_and_review(post_data=res, platform="reddit", meta={"subreddit": subreddit}, threshold=threshold))
+        locales = self._locales_to_run()
+        for locale in locales:
+            for idx, subreddit in enumerate(reddit_cfg.subreddits):
+                if idx >= max_per_day:
+                    break
+                res = self.content_generator.generate_reddit_comment(subreddit=subreddit, locale=locale)
+                drafted.append(
+                    await self._persist_and_review(
+                        post_data=res,
+                        platform="reddit",
+                        meta={"subreddit": subreddit, "locale": locale},
+                        threshold=threshold,
+                    )
+                )
         return [d for d in drafted if d]
 
     async def _generate_youtube_pipeline(self, youtube_cfg) -> List[Dict[str, Any]]:
@@ -764,14 +1092,22 @@ class SystemOrchestrator:
             self.logger.warning("YouTube search failed", extra={"error": search.error})
             return drafted
         videos = search.data.get("items", [])[: youtube_cfg.max_comments_per_day]
-        for video in videos:
-            res = self.content_generator.generate_youtube_comment(video_title=video.get("title",""), video_description=video.get("description",""))
-            drafted.append(await self._persist_and_review(
-                post_data=res,
-                platform="youtube",
-                meta={"video_id": video.get("id"), "video_url": video.get("url")},
-                threshold=youtube_cfg.get("quality_threshold", 0.7),
-            ))
+        locales = self._locales_to_run()
+        for locale in locales:
+            for video in videos:
+                res = self.content_generator.generate_youtube_comment(
+                    video_title=video.get("title", ""),
+                    video_description=video.get("description", ""),
+                    locale=locale,
+                )
+                drafted.append(
+                    await self._persist_and_review(
+                        post_data=res,
+                        platform="youtube",
+                        meta={"video_id": video.get("id"), "video_url": video.get("url"), "locale": locale},
+                        threshold=getattr(youtube_cfg, "quality_threshold", 0.7),
+                    )
+                )
         return [d for d in drafted if d]
 
     async def _persist_and_review(self, post_data: Dict[str, Any], platform: str, meta: Dict[str, Any], threshold: float) -> Optional[Dict[str, Any]]:
@@ -844,6 +1180,16 @@ class SystemOrchestrator:
                         {"human_approved": True, "status": PostStatus.APPROVED}
                     )
         return {"platform": platform, "score": score, "post_id": post_id}
+
+    def _locales_to_run(self) -> List[str]:
+        """Return locales for generation (default + optional parallel locales)."""
+        cfg = self.config_manager.config.content
+        locales = [cfg.default_locale.lower().strip()]
+        for loc in getattr(cfg, "locales_parallel", []) or []:
+            norm = loc.lower().strip()
+            if norm and norm not in locales:
+                locales.append(norm)
+        return locales
 
     async def _run_health_check(self) -> None:
         if not self.health_checker:

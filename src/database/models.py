@@ -41,6 +41,9 @@ class AccountType(enum.Enum):
     REDDIT = "reddit"
     YOUTUBE = "youtube"
     QUORA = "quora"
+    TIKTOK = "tiktok"
+    INSTAGRAM = "instagram"
+    FACEBOOK = "facebook"
 
 
 class AccountStatus(enum.Enum):

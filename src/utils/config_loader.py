@@ -109,10 +109,67 @@ class QuoraPlatformConfig(BaseModel):
     topics: list[str] = Field(default_factory=list)
 
 
+class TikTokPlatformConfig(BaseModel):
+    enabled: bool = False
+    max_comments_per_day: int = Field(default=15, ge=0)
+    min_delay_between_comments: int = Field(default=45, ge=0)
+    max_delay_between_comments: int = Field(default=180, ge=0)
+    user_agents: list[str] = Field(default_factory=list)
+    proxies: list[str] = Field(default_factory=list)
+    preferred_location: Optional[str] = None
+
+    @root_validator
+    def validate_delays(cls, values: Dict[str, Any]) -> Dict[str, Any]:
+        min_delay = values.get("min_delay_between_comments", 0)
+        max_delay = values.get("max_delay_between_comments", 0)
+        if max_delay and min_delay and max_delay < min_delay:
+            raise ValueError("max_delay_between_comments cannot be less than min_delay_between_comments")
+        return values
+
+
+class InstagramPlatformConfig(BaseModel):
+    enabled: bool = False
+    max_comments_per_day: int = Field(default=15, ge=0)
+    min_delay_between_comments: int = Field(default=45, ge=0)
+    max_delay_between_comments: int = Field(default=180, ge=0)
+    user_agents: list[str] = Field(default_factory=list)
+    proxies: list[str] = Field(default_factory=list)
+    preferred_location: Optional[str] = None
+
+    @root_validator
+    def validate_delays(cls, values: Dict[str, Any]) -> Dict[str, Any]:
+        min_delay = values.get("min_delay_between_comments", 0)
+        max_delay = values.get("max_delay_between_comments", 0)
+        if max_delay and min_delay and max_delay < min_delay:
+            raise ValueError("max_delay_between_comments cannot be less than min_delay_between_comments")
+        return values
+
+
+class FacebookPlatformConfig(BaseModel):
+    enabled: bool = False
+    max_comments_per_day: int = Field(default=15, ge=0)
+    min_delay_between_comments: int = Field(default=45, ge=0)
+    max_delay_between_comments: int = Field(default=180, ge=0)
+    user_agents: list[str] = Field(default_factory=list)
+    proxies: list[str] = Field(default_factory=list)
+    preferred_location: Optional[str] = None
+
+    @root_validator
+    def validate_delays(cls, values: Dict[str, Any]) -> Dict[str, Any]:
+        min_delay = values.get("min_delay_between_comments", 0)
+        max_delay = values.get("max_delay_between_comments", 0)
+        if max_delay and min_delay and max_delay < min_delay:
+            raise ValueError("max_delay_between_comments cannot be less than min_delay_between_comments")
+        return values
+
+
 class PlatformsConfig(BaseModel):
     reddit: RedditPlatformConfig = Field(default_factory=RedditPlatformConfig)
     youtube: YoutubePlatformConfig = Field(default_factory=YoutubePlatformConfig)
     quora: QuoraPlatformConfig = Field(default_factory=QuoraPlatformConfig)
+    tiktok: TikTokPlatformConfig = Field(default_factory=TikTokPlatformConfig)
+    instagram: InstagramPlatformConfig = Field(default_factory=InstagramPlatformConfig)
+    facebook: FacebookPlatformConfig = Field(default_factory=FacebookPlatformConfig)
 
 
 class ContentConfig(BaseModel):
@@ -120,6 +177,8 @@ class ContentConfig(BaseModel):
     max_length: int = Field(default=800, ge=50)
     quality_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
     public_sources: list[str] = Field(default_factory=list)
+    default_locale: str = Field(default="en")
+    locales_parallel: list[str] = Field(default_factory=list)
 
     @root_validator
     def validate_lengths(cls, values: Dict[str, Any]) -> Dict[str, Any]:
@@ -128,6 +187,22 @@ class ContentConfig(BaseModel):
         if max_len and min_len and max_len < min_len:
             raise ValueError("max_length cannot be less than min_length")
         return values
+
+    @validator("default_locale")
+    def validate_default_locale(cls, v: str) -> str:
+        allowed = {"en", "id"}
+        val = v.lower().strip()
+        if val not in allowed:
+            raise ValueError(f"default_locale must be one of {allowed}")
+        return val
+
+    @validator("locales_parallel", each_item=True)
+    def validate_locales_parallel(cls, v: str) -> str:
+        allowed = {"en", "id"}
+        val = v.lower().strip()
+        if val not in allowed:
+            raise ValueError(f"locales_parallel entries must be one of {allowed}")
+        return val
 
 
 class MonitoringConfig(BaseModel):
@@ -235,11 +310,8 @@ class ConfigManager:
                 raise ValueError("Top-level configuration must be a mapping")
             return data
 
-    def load_platforms_config(self, path: str) -> Dict[str, Any]:
-        """Load platforms.yaml for adapters (optional helper)."""
-        if not os.path.exists(path):
-            self.logger.warning("Platforms config not found", extra={"component": "config", "path": path})
-            return {}
+    def load_platforms(self, path: str) -> Dict[str, Any]:
+        """Load platforms config (could be separate file)."""
         with open(path, "r", encoding="utf-8") as stream:
             data = yaml.safe_load(stream) or {}
             if not isinstance(data, dict):

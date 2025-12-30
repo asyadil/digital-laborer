@@ -36,7 +36,15 @@ from telegram.error import (
 )
 from telegram.ext import ContextTypes
 
-from src.database.models import Account, AccountType, TelegramInteraction, Post, PostStatus, SystemMetric
+from src.database.models import (
+    Account,
+    AccountType,
+    TelegramInteraction,
+    Post,
+    PostStatus,
+    SystemMetric,
+    ReferralLink,
+)
 from src.database.operations import DatabaseSessionManager
 from src.utils.rate_limiter import FixedWindowRateLimiter
 from src.utils.validators import sanitize_markdown, validate_email, validate_url
@@ -282,6 +290,9 @@ async def cmd_config(controller, update: Update, context: ContextTypes.DEFAULT_T
             "monitoring.health_check_interval": ("monitoring", "health_check_interval"),
             "retry.base_delay": ("retry", "base_delay"),
             "retry.max_delay": ("retry", "max_delay"),
+            "auto.min_quality_auto_post": ("auto", "min_quality_auto_post"),
+            "auto.batch_size": ("auto", "batch_size"),
+            "auto.enabled": ("auto", "enabled"),
         }
         if key not in allowed:
             await controller._send_text(
@@ -294,12 +305,20 @@ async def cmd_config(controller, update: Update, context: ContextTypes.DEFAULT_T
         section_name, attr_name = allowed[key]
         section = getattr(controller.config, section_name, None)
         if section is None:
-            await controller._send_text(
-                update.effective_chat.id,
-                f"❌ Config section `{section_name}` not found.",
-                parse_mode=ParseMode.MARKDOWN_V2,
-            )
-            return
+            # create simple namespace for auto section
+            class _NS:
+                pass
+
+            if section_name == "auto":
+                section = _NS()
+                setattr(controller.config, section_name, section)
+            else:
+                await controller._send_text(
+                    update.effective_chat.id,
+                    f"❌ Config section `{section_name}` not found.",
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                )
+                return
 
         if value is None:
             current = getattr(section, attr_name, "N/A")
@@ -337,6 +356,235 @@ async def cmd_config(controller, update: Update, context: ContextTypes.DEFAULT_T
     except Exception as exc:
         controller.logger.error(f"Error in config command: {exc}", exc_info=True)
         await controller._safe_notify_error("cmd_config", exc)
+
+
+def _env_path() -> Path:
+    return Path(os.getenv("APP_BASE_PATH", Path.cwd())) / ".env"
+
+
+def _load_env_file(path: Path) -> Dict[str, str]:
+    vals: Dict[str, str] = {}
+    if not path.exists():
+        return vals
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            k, v = stripped.split("=", 1)
+            vals[k.strip()] = v.strip()
+    return vals
+
+
+def _save_env_file(path: Path, data: Dict[str, str]) -> None:
+    lines = [f"{k}={v}" for k, v in data.items()]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def _parse_csv_list(raw: str) -> List[str]:
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+async def cmd_secret(controller, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set or get secrets via Telegram (writes to .env and process env)."""
+    try:
+        args = context.args or []
+        if not args:
+            await controller._send_text(
+                update.effective_chat.id,
+                "Usage: /secret NAME=VALUE  (set) or /secret NAME (get masked)",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+            return
+        env_path = _env_path()
+        data = _load_env_file(env_path)
+        arg = args[0]
+        if "=" not in arg:
+            key = arg.strip()
+            val = os.getenv(key) or data.get(key) or ""
+            masked = "***" if val else "(not set)"
+            await controller._send_text(
+                update.effective_chat.id,
+                f"{key} = {masked}",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+            return
+        key, val = arg.split("=", 1)
+        key = key.strip()
+        val = val.strip()
+        data[key] = val
+        _save_env_file(env_path, data)
+        os.environ[key] = val
+        await controller._send_text(
+            update.effective_chat.id,
+            f"✅ Secret `{key}` updated (stored in .env).",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+    except Exception as exc:
+        controller.logger.error("Error in secret command", exc_info=True)
+        await controller._safe_notify_error("cmd_secret", exc)
+
+
+async def cmd_netid(controller, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Manage proxies/user-agents per platform via Telegram."""
+    try:
+        args = context.args or []
+        if not args:
+            await controller._send_text(
+                update.effective_chat.id,
+                "Usage:\n"
+                "/netid <platform> show\n"
+                "/netid <platform> proxies=<p1,p2> [ua=<ua1,ua2>]\n"
+                "Platforms: reddit, youtube, quora, tiktok, instagram, facebook",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+            return
+        platform = args[0].lower()
+        allowed_platforms = {"reddit", "youtube", "quora", "tiktok", "instagram", "facebook"}
+        if platform not in allowed_platforms:
+            await controller._send_text(
+                update.effective_chat.id,
+                f"❌ Platform `{platform}` tidak dikenal. Pilih: {', '.join(sorted(allowed_platforms))}",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+            return
+
+        env_path = _env_path()
+        data = _load_env_file(env_path)
+        cfg = getattr(getattr(controller.config, "platforms", None), platform, None)
+
+        # Show current values
+        if len(args) == 1 or args[1].lower() in {"show", "list"}:
+            proxies = getattr(cfg, "proxies", []) if cfg else []
+            uas = getattr(cfg, "user_agents", []) if cfg else []
+            lines = [
+                f"🔌 Network identity for *{platform}*",
+                f"- proxies ({len(proxies)}): {', '.join(proxies)[:180] or '(empty)'}",
+                f"- user_agents ({len(uas)}): {', '.join(uas)[:180] or '(empty)'}",
+                "_Catatan_: perubahan runtime akan aktif untuk siklus berikutnya; jika adapter sudah aktif, restart ringan disarankan.",
+            ]
+            await controller._send_text(update.effective_chat.id, "\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2)
+            return
+
+        new_proxies: Optional[List[str]] = None
+        new_uas: Optional[List[str]] = None
+        for token in args[1:]:
+            if token.startswith("proxies="):
+                new_proxies = _parse_csv_list(token.split("=", 1)[1])
+            if token.startswith("ua=") or token.startswith("user_agents="):
+                new_uas = _parse_csv_list(token.split("=", 1)[1])
+        if new_proxies is None and new_uas is None:
+            await controller._send_text(
+                update.effective_chat.id,
+                "❌ Tidak ada parameter yang diubah. Gunakan proxies=... atau ua=...",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+            return
+
+        # Apply in-memory config if available
+        if cfg:
+            if new_proxies is not None and hasattr(cfg, "proxies"):
+                try:
+                    cfg.proxies = new_proxies
+                except Exception:
+                    pass
+            if new_uas is not None and hasattr(cfg, "user_agents"):
+                try:
+                    cfg.user_agents = new_uas
+                except Exception:
+                    pass
+
+        # Persist to .env for restart persistence
+        prefix = platform.upper()
+        if new_proxies is not None:
+            data[f"{prefix}_PROXIES"] = ",".join(new_proxies)
+            os.environ[f"{prefix}_PROXIES"] = ",".join(new_proxies)
+        if new_uas is not None:
+            data[f"{prefix}_USER_AGENTS"] = ",".join(new_uas)
+            os.environ[f"{prefix}_USER_AGENTS"] = ",".join(new_uas)
+        _save_env_file(env_path, data)
+
+        lines = [f"✅ Updated network identity for *{platform}*:"]
+        if new_proxies is not None:
+            lines.append(f"- proxies set ({len(new_proxies)})")
+        if new_uas is not None:
+            lines.append(f"- user_agents set ({len(new_uas)})")
+        lines.append("_Catatan_: adapter yang sudah aktif mungkin perlu restart ringan agar pool baru dipakai._")
+        await controller._send_text(update.effective_chat.id, "\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2)
+    except Exception as exc:
+        controller.logger.error("Error in netid command", exc_info=True)
+        await controller._safe_notify_error("cmd_netid", exc)
+
+
+async def cmd_referral(controller, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Manage referral links: list/add/toggle."""
+    try:
+        args = context.args or []
+        if not args or args[0] == "list":
+            platform = args[1] if len(args) > 1 else None
+            with controller.db.session_scope(logger=controller.logger) as session:
+                q = session.query(ReferralLink)
+                if platform:
+                    q = q.filter(ReferralLink.platform_name == platform)
+                links = q.order_by(ReferralLink.id.desc()).limit(20).all()
+            if not links:
+                await controller._send_text(update.effective_chat.id, "No referral links.", parse_mode=ParseMode.MARKDOWN_V2)
+                return
+            lines = ["🔗 Referral links:"]
+            for link in links:
+                status = "✅" if link.active else "⏸️"
+                lines.append(f"{status} id={link.id} {link.platform_name} {link.url}")
+            await controller._send_text(update.effective_chat.id, "\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2)
+            return
+
+        action = args[0]
+        if action == "add" and len(args) >= 3:
+            platform = args[1]
+            url = args[2]
+            category = args[3] if len(args) >= 4 else None
+            commission = float(args[4]) if len(args) >= 5 else 0.0
+            with controller.db.session_scope(logger=controller.logger) as session:
+                rl = ReferralLink(
+                    platform_name=platform,
+                    url=url,
+                    category=category,
+                    commission_rate=commission,
+                    active=True,
+                )
+                session.add(rl)
+            await controller._send_text(
+                update.effective_chat.id,
+                f"✅ Added referral link id={rl.id} for {platform}",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+            return
+        if action == "toggle" and len(args) >= 3:
+            rid = int(args[1])
+            on = args[2].lower() in {"1", "true", "on", "yes", "enable", "aktif"}
+            with controller.db.session_scope(logger=controller.logger) as session:
+                rl = session.query(ReferralLink).filter(ReferralLink.id == rid).first()
+                if not rl:
+                    await controller._send_text(update.effective_chat.id, f"❌ Referral id {rid} not found", parse_mode=ParseMode.MARKDOWN_V2)
+                    return
+                rl.active = on
+                session.add(rl)
+            await controller._send_text(
+                update.effective_chat.id,
+                f"✅ Referral id={rid} {'enabled' if on else 'disabled'}",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+            return
+
+        await controller._send_text(
+            update.effective_chat.id,
+            "Usage:\n/referral list [platform]\n/referral add <platform> <url> [category] [commission]\n/referral toggle <id> <on|off>",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+    except Exception as exc:
+        controller.logger.error("Error in referral command", exc_info=True)
+        await controller._safe_notify_error("cmd_referral", exc)
 
 
 async def cmd_daily_summary(controller, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

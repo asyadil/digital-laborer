@@ -5,7 +5,7 @@
 [![Tests](https://img.shields.io/badge/tests-pytest-blue)](#testing-guide)
 [![Coverage](https://img.shields.io/badge/coverage-75%25%2B-brightgreen)](#testing-guide)
 
-> Production-grade, human-in-the-loop referral automation across Reddit, YouTube, and Quora with Telegram oversight, monitoring, and recovery.
+> Production-grade, human-in-the-loop referral automation across Reddit, YouTube, Quora, TikTok, Instagram Reels, and Facebook comments with Telegram oversight, monitoring, and recovery. Supports dual locale (EN/ID) templates, synonyms, and referral routing plus autonomous fallback mode when the operator is idle.
 
 ---
 
@@ -241,7 +241,8 @@ The primary configuration lives in `config/config.yaml`. Highlights:
 - `platforms.reddit`: enable, OAuth, post limits, delays, quality threshold, subreddits
 - `platforms.youtube`: enable, max_comments_per_day, `search_keywords`
 - `platforms.quora`: enable, max answers, topics
-- `content`: min/max length, quality threshold, public sources
+- `platforms.tiktok` / `instagram` / `facebook`: enable flags, per-day caps, min/max delays, user_agents, proxies (used for rotation/backoff)
+- `content`: min/max length, quality threshold, public sources, `default_locale` (en/id)
 - `monitoring`: health check interval, alert thresholds, retention
 - `logging`: level, format, file path, rotation
 
@@ -323,11 +324,36 @@ platforms:
     topics:
       - "Passive Income"
       - "Side Hustles"
+  tiktok:
+    enabled: true
+    max_comments_per_day: 15
+    min_delay_between_comments: 45
+    max_delay_between_comments: 180
+    user_agents: []
+    proxies: []
+    preferred_location: "id"   # optional routing hint
+  instagram:
+    enabled: true
+    max_comments_per_day: 15
+    min_delay_between_comments: 45
+    max_delay_between_comments: 180
+    user_agents: []
+    proxies: []
+    preferred_location: "id"   # optional routing hint
+  facebook:
+    enabled: true
+    max_comments_per_day: 15
+    min_delay_between_comments: 45
+    max_delay_between_comments: 180
+    user_agents: []
+    proxies: []
+    preferred_location: "id"   # optional routing hint
 
 content:
   min_length: 200
   max_length: 800
   quality_threshold: 0.7
+  default_locale: "en"           # "en" or "id"
   public_sources:
     - "https://www.usa.gov/agencies"
     - "https://archive.org/details/texts"
@@ -361,10 +387,16 @@ Configuration verification checklist:
 - For YouTube: ensure OAuth consent is completed and refresh token is valid.
 - For Quora: verify credentials by manual login once; note if CAPTCHA appears.
 
-### Platform Setup (Reddit, YouTube, Quora)
+### Platform Setup (Reddit, YouTube, Quora, TikTok, Instagram, Facebook)
 - **Reddit OAuth**: Create a “script” app at https://www.reddit.com/prefs/apps. Copy client_id/secret/user_agent. Ensure account can post; enable 2FA only if supported by automation strategy.
 - **YouTube OAuth**: Create OAuth client (Desktop) in Google Cloud Console. Enable YouTube Data API v3. Obtain refresh token via OAuth consent flow; store in credentials store or `.env`.
 - **Quora**: Use real user credentials. Expect CAPTCHA/2FA; the system will escalate challenges to Telegram with screenshots and inline actions (solve/skip/refresh).
+- **TikTok / Instagram Reels / Facebook comments**: Provide working accounts and set `platforms.<name>.user_agents` and `proxies` for rotation/backoff. If your content is geo-sensitive, set `preferred_location` hint per platform (e.g., `"id"`). Adapters include client-side rate limiting, backoff, and anti-bot challenge surfacing to Telegram.
+
+### Locale & Referral Routing
+- Set `content.default_locale` to `en` or `id`. Methods accept explicit `locale` to override.
+- Referral links support `locale` and `platform` filters; see `config/referral_links.yaml`.
+- Templates include EN/ID variants; add more in `config/templates.yaml`. Synonyms can be extended in `config/synonyms.yaml` for richer paraphrasing.
 
 ### Security Best Practices
 - Never commit real secrets. Use `.env` and secret managers.

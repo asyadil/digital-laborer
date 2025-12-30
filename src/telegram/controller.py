@@ -6,10 +6,12 @@ import json
 import logging
 import os
 import uuid
+from asyncio import Queue, QueueEmpty
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Union
 import itertools
+from src.telegram.playbooks import build_playbook
 
 from telegram import (
     InlineKeyboardButton, 
@@ -37,7 +39,7 @@ from telegram.ext import (
     filters
 )
 
-from src.database.models import Account, AccountType, TelegramInteraction
+from src.database.models import Account, AccountType, TelegramInteraction, Post, PostStatus
 from src.database.operations import DatabaseSessionManager
 from src.telegram import handlers
 from src.utils.rate_limiter import FixedWindowRateLimiter
@@ -95,11 +97,16 @@ class TelegramController:
             max_calls=int(getattr(config.telegram, "max_messages_per_minute", 20)),
             window_seconds=60.0,
         )
+        self.idle_threshold_seconds = int(getattr(getattr(config, "telegram", None), "idle_threshold_seconds", 3 * 3600))
+        self.auto_mode = False
+        self._last_user_activity = datetime.utcnow()
         self._notification_queue: asyncio.PriorityQueue[_NotificationItem] = asyncio.PriorityQueue()
         self._pending_futures: dict[str, asyncio.Future] = {}
         self._stop_event = asyncio.Event()
         self._notif_seq = itertools.count()
         self._background_tasks: list[asyncio.Task] = []
+        self._auto_retry_queue: Queue[int] = Queue()
+        self._auto_rotate_queue: Queue[int] = Queue()
 
     @property
     def pending_actions_count(self) -> int:
@@ -123,6 +130,10 @@ class TelegramController:
             # Background escalation monitor
             self._background_tasks.append(
                 asyncio.create_task(self._escalation_worker(), name="telegram_escalation_worker")
+            )
+            # Auto-mode monitor for idle user
+            self._background_tasks.append(
+                asyncio.create_task(self._auto_mode_worker(), name="telegram_auto_mode_worker")
             )
 
             await self.send_notification("System started successfully", priority="INFO")
@@ -155,6 +166,9 @@ class TelegramController:
         app.add_handler(CommandHandler("daily_summary", lambda u, c: self._authorized(handlers.cmd_daily_summary, u, c)))
         app.add_handler(CommandHandler("pending", lambda u, c: self._authorized(handlers.cmd_pending, u, c)))
         app.add_handler(CommandHandler("report", lambda u, c: self._authorized(handlers.cmd_report, u, c)))
+        app.add_handler(CommandHandler("secret", lambda u, c: self._authorized(handlers.cmd_secret, u, c)))
+        app.add_handler(CommandHandler("netid", lambda u, c: self._authorized(handlers.cmd_netid, u, c)))
+        app.add_handler(CommandHandler("referral", lambda u, c: self._authorized(handlers.cmd_referral, u, c)))
         # Help: show commands
         
         # Action handlers
@@ -184,6 +198,12 @@ class TelegramController:
                     extra={"component": "telegram", "chat_id": chat_id, "user_id": user_id},
                 )
                 return
+            # Mark user as active
+            self._last_user_activity = datetime.utcnow()
+            if self.auto_mode:
+                self.auto_mode = False
+                await self.send_notification("👋 Detected activity. Auto-mode dimatikan.", priority="INFO")
+                await self._send_blocked_summary()
             await handler_func(self, update, context)
         except Exception as exc:
             await self._safe_notify_error("authorized_handler", exc)
@@ -640,6 +660,18 @@ class TelegramController:
                 account_id = query.data.split(":")[1]
                 await self._delete_account(update, account_id)
                 
+            elif query.data.startswith("action:auto:"):
+                # Auto-mode helper buttons
+                parts = query.data.split(":")
+                action = parts[2] if len(parts) >= 3 else ""
+                post_id = int(parts[3]) if len(parts) >= 4 and parts[3].isdigit() else None
+                if action == "rotate":
+                    await self._handle_auto_rotate(update, post_id)
+                elif action == "retry":
+                    await self._handle_auto_retry(update, post_id)
+                elif action == "skip":
+                    await self._handle_auto_skip(update, post_id)
+
             # Handle action responses (approve/reject/edit)
             elif query.data.startswith(("approve:", "reject:", "edit:")):
                 action_type, action_id = query.data.split(":", 1)
@@ -758,6 +790,11 @@ class TelegramController:
             chat_id = str(update.effective_chat.id) if update.effective_chat else ""
             if chat_id != self.user_chat_id:
                 return
+            self._last_user_activity = datetime.utcnow()
+            if self.auto_mode:
+                self.auto_mode = False
+                await self.send_notification("👋 Detected activity. Auto-mode dimatikan.", priority="INFO")
+                await self._send_blocked_summary()
             # If there are pending actions, treat incoming text as a response to the most recent one.
             if self._pending_futures:
                 # Pick the most recently created future (last inserted key)
@@ -770,6 +807,145 @@ class TelegramController:
                 )
         except Exception:
             return
+
+    async def _auto_mode_worker(self, interval_seconds: int = 300) -> None:
+        """Enable auto-mode after prolonged user inactivity."""
+        while not self._stop_event.is_set():
+            try:
+                await asyncio.sleep(interval_seconds)
+                now = datetime.utcnow()
+                idle_seconds = (now - self._last_user_activity).total_seconds()
+                if not self.auto_mode and idle_seconds >= self.idle_threshold_seconds:
+                    self.auto_mode = True
+                    await self.send_notification(
+                        f"🤖 Auto-mode aktif (idle ≥ {self.idle_threshold_seconds//3600} jam). "
+                        "Bot akan menjalankan langkah aman (retry/backoff/rotate) secara otomatis bila memungkinkan.",
+                        priority="WARN",
+                    )
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                self.logger.error(
+                    "Auto-mode worker error",
+                    extra={"component": "telegram", "error": str(exc)},
+                )
+                continue
+
+    async def _send_blocked_summary(self, limit: int = 10) -> None:
+        """Send summary of blocked_auto, failed, or skipped posts when user returns."""
+        try:
+            with self.db.session_scope(logger=self.logger) as session:
+                blocked = (
+                    session.query(Post)
+                    .filter(
+                        (Post.status == PostStatus.APPROVED)
+                        & (Post.metadata_json["blocked_auto"].as_boolean() == True)  # type: ignore[index]
+                    )
+                    .order_by(Post.updated_at.desc())
+                    .limit(limit)
+                    .all()
+                )
+                failed = (
+                    session.query(Post)
+                    .filter(Post.status == PostStatus.FAILED)
+                    .order_by(Post.updated_at.desc())
+                    .limit(limit)
+                    .all()
+                )
+                skipped = (
+                    session.query(Post)
+                    .filter(Post.metadata_json["skip_auto"].as_boolean() == True)  # type: ignore[index]
+                    .order_by(Post.updated_at.desc())
+                    .limit(limit)
+                    .all()
+                )
+            if not blocked and not failed and not skipped:
+                return
+            lines = ["⚠️ Ringkasan hambatan saat auto-mode:"]
+            if blocked:
+                lines.append("• blocked_auto:")
+                for row in blocked:
+                    reason = (row.metadata_json or {}).get("blocked_reason") or row.error_message or "unknown"
+                    lines.append(f"  - post_id={row.id} {row.platform} reason={reason}")
+            if failed:
+                lines.append("• failed:")
+                for row in failed:
+                    lines.append(f"  - post_id={row.id} {row.platform} err={row.error_message or 'unknown'}")
+            if skipped:
+                lines.append("• skipped (skip_auto):")
+                for row in skipped:
+                    lines.append(f"  - post_id={row.id} {row.platform}")
+            await self.send_notification("\n".join(lines), priority="WARN")
+        except Exception as exc:
+            self.logger.error(
+                "Failed to send blocked summary",
+                extra={"component": "telegram", "error": str(exc)},
+            )
+
+    def consume_auto_retry(self, max_items: int = 10) -> list[int]:
+        """Drain queued auto-retry requests."""
+        items: list[int] = []
+        for _ in range(max_items):
+            try:
+                items.append(self._auto_retry_queue.get_nowait())
+            except QueueEmpty:
+                break
+        return items
+
+    def consume_auto_rotate(self, max_items: int = 10) -> list[int]:
+        """Drain queued auto-rotate requests."""
+        items: list[int] = []
+        for _ in range(max_items):
+            try:
+                items.append(self._auto_rotate_queue.get_nowait())
+            except QueueEmpty:
+                break
+        return items
+
+    async def _handle_auto_rotate(self, update: Update, post_id: Optional[int]) -> None:
+        """Queue rotate+retry request."""
+        try:
+            if post_id is not None:
+                self._auto_rotate_queue.put_nowait(post_id)
+            await self._send_text(
+                update.effective_chat.id,
+                "🔄 Rotate diminta. Sistem akan memakai akun/proxy/UA berikutnya pada percobaan berikut.",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+        except Exception as exc:
+            await self._safe_notify_error("auto_rotate", exc)
+
+    async def _handle_auto_retry(self, update: Update, post_id: Optional[int]) -> None:
+        """Queue retry request."""
+        try:
+            if post_id is not None:
+                self._auto_retry_queue.put_nowait(post_id)
+            await self._send_text(
+                update.effective_chat.id,
+                "🔁 Retry diminta. Bot akan menjadwalkan ulang posting untuk post tersebut.",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+        except Exception as exc:
+            await self._safe_notify_error("auto_retry", exc)
+
+    async def _handle_auto_skip(self, update: Update, post_id: Optional[int]) -> None:
+        """Mark skip request (set metadata flag)."""
+        try:
+            if post_id is not None:
+                with self.db.session_scope(logger=self.logger) as session:
+                    post = session.query(Post).filter(Post.id == post_id).first()
+                    if post:
+                        meta = post.metadata_json or {}
+                        meta["skip_auto"] = True
+                        post.metadata_json = meta
+                        session.add(post)
+            await self._send_text(
+                update.effective_chat.id,
+                "⏭️ Ditandai skip. Tidak ada tindakan lanjutan otomatis.",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+        except Exception as exc:
+            await self._safe_notify_error("auto_skip", exc)
 
     async def _rehydrate_pending_actions(self) -> None:
         """Rehydrate pending actions so bot can survive restart.
@@ -824,26 +1000,28 @@ class TelegramController:
             chunks.append(current)
         return chunks
 
-    async def _safe_notify_error(self, context: str, error: Exception) -> None:
-        """Safely send an error notification with retry logic."""
-        error_msg = f"Error in {context}: {str(error)}"
-        self.logger.error(error_msg, exc_info=error)
-        
+    async def _safe_notify_error(self, context: str, error: Exception, error_code: str | None = None) -> None:
+        """Safely send an error notification with guided remediation playbook."""
+        code = (error_code or getattr(error, "code", None) or context or "unknown").strip().lower()
+        playbook = build_playbook(code)
+        self.logger.error("Error in %s [%s]: %s", context, code, str(error), exc_info=error)
+        steps = "\n".join([f"{idx+1}. {step}" for idx, step in enumerate(playbook.steps)])
+        text = f"{playbook.title}\nContext: `{context}`\nError: `{sanitize_markdown(str(error))}`\n\nLangkah:\n{steps}"
+
+        buttons = []
+        retry_cb = f"action:{uuid.uuid4()}:retry"
+        if playbook.allow_retry:
+            buttons.append(InlineKeyboardButton("🔁 Retry (setelah langkah)", callback_data=retry_cb))
+        if playbook.allow_rotate:
+            buttons.append(InlineKeyboardButton("🔄 Rotate akun/proxy/UA", callback_data="action:auto:rotate"))
+        if playbook.allow_skip:
+            buttons.append(InlineKeyboardButton("⏭️ Skip", callback_data="action:auto:skip"))
+        reply_markup = InlineKeyboardMarkup([buttons]) if buttons else None
+
         try:
-            # Truncate very long error messages
-            error_str = str(error)
-            if len(error_str) > 1000:
-                error_str = error_str[:500] + "..." + error_str[-500:]
-                
-            await self._send_text(
-                self.user_chat_id,
-                f"❌ *Error in {context}*\n`{sanitize_markdown(error_str)}`",
-                parse_mode=ParseMode.MARKDOWN_V2
-            )
-        except Exception as send_error:
-            self.logger.error(f"Failed to send error notification: {send_error}")
-            # If we can't send the error message, there's not much we can do
-            pass
+            await self.send_notification(text, priority="ERROR", reply_markup=reply_markup)
+        except Exception:
+            self.logger.exception("Failed to send error notification", extra={"component": "telegram"})
             
     async def _send_text(
         self, 
