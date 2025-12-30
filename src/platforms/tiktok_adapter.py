@@ -75,7 +75,7 @@ class TikTokAdapter(BasePlatformAdapter):
             success=True,
             data={
                 "comment_id": comment_id,
-                "comment_url": f"https://www.tiktok.com/comment/{comment_id}",
+                "comment_url": f"https://www.tiktok.com/video/{target_id}?comment_id={comment_id}",
                 "username": account.get("username", "unknown"),
                 "account_id": account.get("id"),
                 "rotate_account": False,

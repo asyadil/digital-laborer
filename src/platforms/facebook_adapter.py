@@ -71,7 +71,7 @@ class FacebookAdapter(BasePlatformAdapter):
             success=True,
             data={
                 "comment_id": comment_id,
-                "comment_url": f"https://www.facebook.com/comment/{comment_id}",
+                "comment_url": f"https://www.facebook.com/{target_id}?comment_id={comment_id}",
                 "username": account.get("username", "unknown"),
                 "account_id": account.get("id"),
                 "rotate_account": False,
