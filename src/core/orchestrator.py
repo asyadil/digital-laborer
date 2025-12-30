@@ -18,7 +18,7 @@ from src.telegram.playbooks import build_playbook
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from src.database.operations import create_engine_from_config, init_db, DatabaseSessionManager
-from src.database.models import Post, PostStatus, Account
+from src.database.models import Post, PostStatus, Account, ReferralLink
 from src.database.migrations import run_migrations
 from src.core.scheduler import Scheduler
 from src.platforms.reddit_adapter import RedditAdapter
@@ -118,6 +118,7 @@ class SystemOrchestrator:
         self.degraded_mode = False
         self._recovery_backoff_seconds = 300
         self._monitoring_disabled = False
+        self._fallback_referral_links: List[Dict[str, Any]] = []
         # Basic per-platform rate limiters (tokens per second, capacity burst)
         self.platform_limiters: dict[str, TokenBucketRateLimiter] = {
             "reddit": TokenBucketRateLimiter(rate=1 / 30, capacity=5),   # ~2 per minute burst 5
@@ -748,7 +749,15 @@ class SystemOrchestrator:
             "service_recovery",
             interval_seconds=self._recovery_backoff_seconds,
             start_in_seconds=self._recovery_backoff_seconds,
-            coro_factory=lambda: self._recover_adapters(),
+            coro_factory=lambda: self._service_recovery_loop(),
+        )
+
+        # Refresh referral links from DB periodically (ensures bot updates are picked up)
+        self.scheduler.schedule_every(
+            "refresh_referrals",
+            interval_seconds=600,
+            start_in_seconds=45,
+            coro_factory=lambda: self._refresh_referral_links(),
         )
 
         # Daily analytics at 09:00 UTC
@@ -844,11 +853,60 @@ class SystemOrchestrator:
                 extra={"component": "orchestrator", "path": referral_path, "error": str(exc)},
             )
 
+        self._fallback_referral_links = referral_links.get("referral_links", []) if isinstance(referral_links, dict) else []
+        db_referral_links = self._load_referral_links_from_db()
         self.content_generator = ContentGenerator(
             config=self.config_manager.config,
             templates=self.template_manager,
             synonyms=synonyms,
-            referral_links=referral_links.get("referral_links", []),
+            referral_links=db_referral_links or self._fallback_referral_links,
+        )
+
+    def _load_referral_links_from_db(self) -> List[Dict[str, Any]]:
+        """Fetch active referral links from DB for content generator."""
+        try:
+            with self.db.session_scope(logger=self.logger) as session:
+                rows: List[ReferralLink] = (
+                    session.query(ReferralLink)
+                    .filter(ReferralLink.active.is_(True))
+                    .order_by(ReferralLink.id.desc())
+                    .limit(200)
+                    .all()
+                )
+            links: List[Dict[str, Any]] = []
+            for row in rows:
+                links.append(
+                    {
+                        "platform_name": row.platform_name,
+                        "url": row.url,
+                        "category": row.category,
+                        "commission_rate": row.commission_rate,
+                        "active": row.active,
+                        # locale not stored in DB schema; defaulting to en
+                        "locale": "en",
+                        "clicks": row.clicks,
+                        "conversions": row.conversions,
+                        "earnings": row.earnings,
+                    }
+                )
+            return links
+        except Exception as exc:  # pragma: no cover - defensive guard
+            self.logger.error(
+                "Failed to load referral links from DB",
+                extra={"component": "orchestrator", "error": str(exc)},
+            )
+            return []
+
+    async def _refresh_referral_links(self) -> None:
+        """Periodically refresh referral links from DB (fallback to YAML/env)."""
+        if not self.content_generator:
+            return
+        db_links = self._load_referral_links_from_db()
+        chosen = db_links or self._fallback_referral_links
+        self.content_generator.referral_links = chosen
+        self.logger.info(
+            "Referral links refreshed",
+            extra={"component": "orchestrator", "source": "db" if db_links else "fallback", "count": len(chosen)},
         )
 
     def _init_platform_adapters(self) -> None:

@@ -1,6 +1,7 @@
-"""Facebook comment adapter (stub with rate-limit/backoff)."""
+"""Facebook comment adapter (rate-limit/backoff with optional real driver)."""
 from __future__ import annotations
 
+import importlib
 import logging
 import random
 import time
@@ -29,6 +30,7 @@ class FacebookAdapter(BasePlatformAdapter):
         cfg = getattr(getattr(config, "platforms", None), "facebook", {}) or {}
         if hasattr(cfg, "dict"):
             cfg = cfg.dict()
+        self.simulate = bool(cfg.get("simulate", True))
         rate = 1 / max(float(cfg.get("min_delay_between_comments", 180)), 1.0)
         self.rate_limiter = TokenBucketRateLimiter(rate=rate, capacity=3)
         self.daily_limiter = TokenBucketRateLimiter(
@@ -41,6 +43,7 @@ class FacebookAdapter(BasePlatformAdapter):
         self._proxy_pool = cfg.get("proxies") or []
         self._current_ua: Optional[str] = None
         self._current_proxy: Optional[str] = None
+        self._driver = self._load_driver(cfg.get("driver_class"))
 
     def _rotate_identity(self) -> None:
         cfg_obj = self._cfg_ref
@@ -58,11 +61,18 @@ class FacebookAdapter(BasePlatformAdapter):
 
     def login(self, account: Dict[str, Any]) -> AdapterResult:
         self._rotate_identity()
+        if not self.simulate and self._driver:
+            res = self._driver.login(account)
+            if res.get("success", True):
+                return AdapterResult(success=True, data=res.get("data", {}))
+            return AdapterResult(success=False, data=res.get("data", {}), error=res.get("error"))
         username = account.get("username", "unknown")
         return AdapterResult(success=True, data={"username": username, "proxy": self._current_proxy})
 
     def find_target_posts(self, location: str, limit: int = 5) -> AdapterResult:
-        # Stub: simulate fetching posts for a page/group/topic
+        if not self.simulate and self._driver:
+            res = self._driver.find_target_posts(location=location, limit=limit)
+            return AdapterResult(success=bool(res.get("success", True)), data=res.get("data", {}), error=res.get("error"))
         items = [
             {"id": f"fb_{int(time.time())}_{i}", "score": random.randint(30, 150), "location": location}
             for i in range(min(limit, 5))
@@ -97,6 +107,16 @@ class FacebookAdapter(BasePlatformAdapter):
                 error="Captcha or verification required",
                 retry_recommended=False,
             )
+        if not self.simulate and self._driver:
+            res = self._driver.post_comment(target_id=target_id, content=content, account=account)
+            if res.get("success"):
+                return AdapterResult(success=True, data=res.get("data", {}))
+            return AdapterResult(
+                success=False,
+                data=res.get("data", {"error_code": "post_failed"}),
+                error=res.get("error") or "post_failed",
+                retry_recommended=bool(res.get("retry_recommended", False)),
+            )
         comment_id = f"fbc_{int(time.time())}_{random.randint(1000,9999)}"
         return AdapterResult(
             success=True,
@@ -110,11 +130,29 @@ class FacebookAdapter(BasePlatformAdapter):
         )
 
     def get_comment_metrics(self, comment_url: str) -> AdapterResult:
+        if not self.simulate and self._driver:
+            res = self._driver.get_comment_metrics(comment_url)
+            return AdapterResult(success=bool(res.get("success", True)), data=res.get("data", {}), error=res.get("error"))
         metrics = {"reactions": random.randint(0, 30), "replies": random.randint(0, 5)}
         return AdapterResult(success=True, data=metrics)
 
     def check_account_health(self, account: Dict[str, Any]) -> AdapterResult:
+        if not self.simulate and self._driver:
+            res = self._driver.check_account_health(account)
+            return AdapterResult(success=bool(res.get("success", True)), data=res.get("data", {}), error=res.get("error"))
         return AdapterResult(success=True, data={"status": "healthy"})
 
     def close(self) -> None:
         return None
+
+    def _load_driver(self, driver_class: Optional[str]):
+        if not driver_class:
+            return None
+        try:
+            module_name, class_name = driver_class.rsplit(".", 1)
+            module = importlib.import_module(module_name)
+            klass = getattr(module, class_name)
+            return klass()
+        except Exception as exc:
+            self.logger.error("Failed to load Facebook driver %s: %s", driver_class, exc)
+            return None

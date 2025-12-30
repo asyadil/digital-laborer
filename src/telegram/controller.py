@@ -721,6 +721,28 @@ class TelegramController:
                 else:
                     await self._safe_notify_error("callback_action_parse", ValueError("Invalid action callback format"))
 
+            # Referral inline callbacks
+            elif query.data.startswith("referral_page:"):
+                page = query.data.split(":")[1] if ":" in query.data else "1"
+                context.args = [page]
+                await handlers._send_referral_list(self, update, page=int(page))
+            elif query.data.startswith("referral_toggle:"):
+                parts = query.data.split(":")
+                if len(parts) >= 3:
+                    rid = parts[1]
+                    on = parts[2]
+                    page = int(parts[3]) if len(parts) >= 4 and parts[3].isdigit() else 1
+                    context.args = [rid, "on" if on in {"on", "true"} else "off"]
+                    await handlers.cmd_referral_toggle(self, update, context, page=page)
+            elif query.data == "referral_help":
+                await self._send_text(
+                    update.effective_chat.id,
+                    "Usage:\n/referral list [platform]\n/referral add <platform> <url> [category] [commission]\n/referral toggle <id> <on|off>",
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                )
+            elif query.data == "referral_add":
+                await handlers.cmd_referral_add_prompt(self, update, context)
+
         except Exception as exc:
             await self._safe_notify_error("callback_query", exc)
             

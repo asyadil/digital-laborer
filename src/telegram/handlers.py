@@ -19,10 +19,10 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from sqlalchemy import func
 from telegram import (
-    InlineKeyboardButton, 
-    InlineKeyboardMarkup, 
-    ReplyKeyboardMarkup, 
-    ReplyKeyboardRemove, 
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
     Update
 )
 from telegram.constants import ParseMode
@@ -38,12 +38,11 @@ from telegram.ext import ContextTypes
 
 from src.database.models import (
     Account,
-    AccountType,
-    TelegramInteraction,
     Post,
     PostStatus,
     SystemMetric,
     ReferralLink,
+    TelegramInteraction,
 )
 from src.database.operations import DatabaseSessionManager
 from src.utils.rate_limiter import FixedWindowRateLimiter
@@ -542,25 +541,87 @@ async def cmd_netid(controller, update: Update, context: ContextTypes.DEFAULT_TY
         await controller._safe_notify_error("cmd_netid", exc)
 
 
+async def _send_referral_list(
+    controller,
+    update: Update,
+    page: int = 1,
+    page_size: int = 10,
+) -> None:
+    """Send referral links with inline controls."""
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    if not chat_id:
+        return
+    try:
+        page = max(1, int(page))
+    except Exception:
+        page = 1
+
+    try:
+        with controller.db.session_scope(logger=controller.logger) as session:
+            total = session.query(func.count(ReferralLink.id)).scalar() or 0
+            links = (
+                session.query(ReferralLink)
+                .order_by(ReferralLink.id.desc())
+                .offset((page - 1) * page_size)
+                .limit(page_size)
+                .all()
+            )
+        if not links:
+            await controller._send_text(
+                chat_id,
+                "No referral links. Tambah dengan /referral add <platform> <url> [category] [commission]",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+            return
+
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        lines = [f"🔗 *Referral links* (page {page}/{total_pages})"]
+        keyboard = []
+        for link in links:
+            status = "✅" if link.active else "⏸️"
+            toggle_label = "Disable" if link.active else "Enable"
+            lines.append(f"{status} id={link.id} {link.platform_name} · {link.url}")
+            keyboard.append(
+                [
+                    InlineKeyboardButton(
+                        f"{toggle_label} #{link.id}",
+                        callback_data=f"referral_toggle:{link.id}:{'off' if link.active else 'on'}:{page}",
+                    )
+                ]
+            )
+
+        nav_row = []
+        if page > 1:
+            nav_row.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"referral_page:{page-1}"))
+        if page < total_pages:
+            nav_row.append(InlineKeyboardButton("Next ➡️", callback_data=f"referral_page:{page+1}"))
+        if nav_row:
+            keyboard.append(nav_row)
+        keyboard.append([InlineKeyboardButton("🔄 Refresh", callback_data=f"referral_page:{page}")])
+        keyboard.append(
+            [
+                InlineKeyboardButton("➕ Add", callback_data="referral_add"),
+                InlineKeyboardButton("ℹ️ Help", callback_data="referral_help"),
+            ]
+        )
+
+        await controller._send_text(
+            chat_id,
+            "\n".join(lines),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+    except Exception as exc:
+        controller.logger.error("Error sending referral list", exc_info=True)
+        await controller._safe_notify_error("send_referral_list", exc)
+
+
 async def cmd_referral(controller, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Manage referral links: list/add/toggle."""
+    """Manage referral links: list/add/toggle (command) + inline list."""
     try:
         args = context.args or []
         if not args or args[0] == "list":
-            platform = args[1] if len(args) > 1 else None
-            with controller.db.session_scope(logger=controller.logger) as session:
-                q = session.query(ReferralLink)
-                if platform:
-                    q = q.filter(ReferralLink.platform_name == platform)
-                links = q.order_by(ReferralLink.id.desc()).limit(20).all()
-            if not links:
-                await controller._send_text(update.effective_chat.id, "No referral links.", parse_mode=ParseMode.MARKDOWN_V2)
-                return
-            lines = ["🔗 Referral links:"]
-            for link in links:
-                status = "✅" if link.active else "⏸️"
-                lines.append(f"{status} id={link.id} {link.platform_name} {link.url}")
-            await controller._send_text(update.effective_chat.id, "\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2)
+            await _send_referral_list(controller, update, page=1)
             return
 
         action = args[0]
@@ -609,6 +670,115 @@ async def cmd_referral(controller, update: Update, context: ContextTypes.DEFAULT
     except Exception as exc:
         controller.logger.error("Error in referral command", exc_info=True)
         await controller._safe_notify_error("cmd_referral", exc)
+
+
+async def cmd_referral_toggle(controller, update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 1) -> None:
+    """Toggle referral active flag via inline button and refresh list."""
+    try:
+        args = context.args or []
+        if len(args) < 2:
+            await controller._send_text(
+                update.effective_chat.id,
+                "Usage: /referral toggle <id> <on|off>",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+            return
+        rid = int(args[0])
+        on = args[1].lower() in {"1", "true", "on", "yes", "enable", "aktif"}
+        with controller.db.session_scope(logger=controller.logger) as session:
+            rl = session.query(ReferralLink).filter(ReferralLink.id == rid).first()
+            if not rl:
+                await controller._send_text(
+                    update.effective_chat.id,
+                    f"❌ Referral id {rid} not found",
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                )
+                return
+            rl.active = on
+            session.add(rl)
+        await controller._send_text(
+            update.effective_chat.id,
+            f"✅ Referral id={rid} {'enabled' if on else 'disabled'}",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        # Refresh list to reflect change
+        await _send_referral_list(controller, update, page=page)
+    except Exception as exc:
+        controller.logger.error("Error in referral toggle", exc_info=True)
+        await controller._safe_notify_error("cmd_referral_toggle", exc)
+
+
+async def cmd_referral_add_prompt(controller, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ask user for referral data via inline flow and save to DB."""
+    try:
+        msg = (
+            "Masukkan referral dalam satu baris:\n"
+            "`<platform> <url> [category] [commission]`\n"
+            "Contoh:\n"
+            "`reddit https://example.com/ref abc 5.0`\n"
+            "`all https://example.com/ref`"
+        )
+        res = await controller.request_custom_input(
+            action_type="referral_add",
+            context={},
+            message=msg,
+            timeout=600,
+        )
+        if res.timeout or not res.response_value:
+            await controller._send_text(
+                update.effective_chat.id,
+                "⏱️ Input referral dibatalkan/timeout.",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+            return
+
+        text = res.response_value.strip()
+        parts = text.split()
+        if len(parts) < 2:
+            await controller._send_text(
+                update.effective_chat.id,
+                "Format salah. Gunakan: `<platform> <url> [category] [commission]`",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+            return
+
+        platform = parts[0]
+        url = parts[1]
+        category = parts[2] if len(parts) >= 3 else None
+        commission = 0.0
+        if len(parts) >= 4:
+            try:
+                commission = float(parts[3])
+            except ValueError:
+                commission = 0.0
+
+        if not validate_url(url):
+            await controller._send_text(
+                update.effective_chat.id,
+                "URL tidak valid.",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+            return
+
+        with controller.db.session_scope(logger=controller.logger) as session:
+            rl = ReferralLink(
+                platform_name=platform,
+                url=url,
+                category=category,
+                commission_rate=commission,
+                active=True,
+            )
+            session.add(rl)
+
+        await controller._send_text(
+            update.effective_chat.id,
+            f"✅ Added referral link id={rl.id} for {platform}",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        await _send_referral_list(controller, update, page=1)
+    except Exception as exc:
+        controller.logger.error("Error in referral add prompt", exc_info=True)
+        await controller._safe_notify_error("cmd_referral_add_prompt", exc)
 
 
 async def cmd_daily_summary(controller, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

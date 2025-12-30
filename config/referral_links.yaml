@@ -1,24 +1,7 @@
 referral_links:
-  - platform_name: "Brave"
-    url: "https://brave.com/ref/sample"
-    category: "browser"
-    commission_rate: 5.0
-    active: true
-    locale: "en"
-    clicks: 0
-    conversions: 0
-    earnings: 0.0
-  - platform_name: "Rakuten"
-    url: "https://www.rakuten.com/r/SAMPLE"
-    category: "cashback"
-    commission_rate: 4.0
-    active: true
-    locale: "en"
-    clicks: 0
-    conversions: 0
-    earnings: 0.0
-  - platform_name: "HoneyGain"
-    url: "https://r.honeygain.me/SAMPLE"
+  # EN/global — isi URL dengan kode referral di control panel/env vars
+  - platform_name: "all"
+    url: ${REFERRAL_HONEYGAIN_URL}
     category: "passive_income"
     commission_rate: 10.0
     active: true
@@ -26,8 +9,19 @@ referral_links:
     clicks: 0
     conversions: 0
     earnings: 0.0
-  - platform_name: "Swagbucks"
-    url: "https://www.swagbucks.com/p/register?rb=SAMPLE"
+
+  - platform_name: "all"
+    url: ${REFERRAL_PACKETSTREAM_URL}
+    category: "passive_income"
+    commission_rate: 20.0
+    active: true
+    locale: "en"
+    clicks: 0
+    conversions: 0
+    earnings: 0.0
+
+  - platform_name: "all"
+    url: ${REFERRAL_SWAGBUCKS_URL}
     category: "surveys"
     commission_rate: 3.0
     active: true
@@ -35,8 +29,29 @@ referral_links:
     clicks: 0
     conversions: 0
     earnings: 0.0
-  - platform_name: "UserTesting"
-    url: "https://www.usertesting.com/signup?ref=SAMPLE"
+
+  - platform_name: "all"
+    url: ${REFERRAL_RAKUTEN_URL}
+    category: "cashback"
+    commission_rate: 4.0
+    active: true
+    locale: "en"
+    clicks: 0
+    conversions: 0
+    earnings: 0.0
+
+  - platform_name: "all"
+    url: ${REFERRAL_BRAVE_URL}
+    category: "browser"
+    commission_rate: 5.0
+    active: true
+    locale: "en"
+    clicks: 0
+    conversions: 0
+    earnings: 0.0
+
+  - platform_name: "all"
+    url: ${REFERRAL_USERTESTING_URL}
     category: "testing"
     commission_rate: 15.0
     active: true
@@ -44,8 +59,10 @@ referral_links:
     clicks: 0
     conversions: 0
     earnings: 0.0
-  - platform_name: "Ajaib"
-    url: "https://link.ajaib.co.id/ref/SAMPLEID"
+
+  # ID — isi URL dengan kode referral lokal
+  - platform_name: "all"
+    url: ${REFERRAL_AJAIB_URL}
     category: "investasi"
     commission_rate: 5.0
     active: true
@@ -53,8 +70,9 @@ referral_links:
     clicks: 0
     conversions: 0
     earnings: 0.0
-  - platform_name: "Bibit"
-    url: "https://bibit.id/ref/SAMPLEID"
+
+  - platform_name: "all"
+    url: ${REFERRAL_BIBIT_URL}
     category: "investasi"
     commission_rate: 4.0
     active: true

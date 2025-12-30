@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import logging
 import os
 import stat
+import urllib.request
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Optional, Protocol
 
@@ -31,6 +33,8 @@ DEFAULT_ENV_FILE = Path(os.getenv("APP_BASE_PATH", Path.cwd())) / ".env"
 DEFAULT_FALLBACK_FILE = Path(os.getenv("APP_BASE_PATH", Path.cwd())) / "data" / ".secrets_backup"
 EXPECTED_PERMS = 0o600
 ENV_ENC_KEY_NAME = "SECRET_ENC_KEY"
+ENV_HTTP_PROVIDER_URL = "SECRET_PROVIDER_URL"
+ENV_HTTP_PROVIDER_TOKEN = "SECRET_PROVIDER_TOKEN"
 
 LOGGER = logging.getLogger(__name__)
 
@@ -93,7 +97,7 @@ class SecretsManager:
     ) -> None:
         self.env_file_path = env_file_path or DEFAULT_ENV_FILE
         self.fallback_files = list(fallback_files) if fallback_files else [DEFAULT_FALLBACK_FILE]
-        self.external_provider = external_provider
+        self.external_provider = external_provider or self._build_http_provider_from_env()
         self.logger = logger or LOGGER
 
     def get(
@@ -180,3 +184,27 @@ class SecretsManager:
 
     def _log_source(self, name: str, source: str) -> None:
         self.logger.info("Loaded secret '%s' from %s", name, source)
+
+    def _build_http_provider_from_env(self) -> Optional[SecretProvider]:
+        url = os.getenv(ENV_HTTP_PROVIDER_URL)
+        if not url:
+            return None
+        token = os.getenv(ENV_HTTP_PROVIDER_TOKEN)
+
+        class _HttpSecretProvider:
+            def get_secret(self, name: str) -> Optional[str]:
+                req_url = f"{url.rstrip('/')}/secret?name={name}"
+                req = urllib.request.Request(req_url)
+                if token:
+                    req.add_header("Authorization", f"Bearer {token}")
+                with urllib.request.urlopen(req, timeout=5) as resp:  # nosec B310
+                    payload = resp.read().decode("utf-8")
+                    try:
+                        data = json.loads(payload)
+                        if isinstance(data, dict):
+                            return data.get("value") or data.get("secret") or data.get(name)
+                    except Exception:
+                        return payload.strip() or None
+                return None
+
+        return _HttpSecretProvider()
